@@ -24,7 +24,7 @@ GROQ_KEY_PRIMARY = os.getenv("GROQ_API_KEY")
 GROQ_KEY_ALT = os.getenv("GROQ_API_KEY_ALT")
 
 
-# ========== LOG DIRECTORY SETUP ==========
+# ========= LOG DIRECTORY SETUP =========
 APP_DIR = Path(__file__).parent
 LOG_DIR = APP_DIR / "resume_screener_logs"
 LOG_DIR.mkdir(exist_ok=True)
