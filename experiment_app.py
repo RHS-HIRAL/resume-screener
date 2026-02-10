@@ -10,44 +10,66 @@ import pandas as pd
 from datetime import datetime
 import logging
 from logging.handlers import RotatingFileHandler
-import io
 from pathlib import Path
+from groq import Groq
 
 # Load environment variables
 load_dotenv()
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+api_key = os.getenv("GROQ_API_KEY")
+client = Groq(api_key=api_key)
 
 
 # ========== LOG DIRECTORY SETUP ==========
-# All logs go into a "resume_screener_logs" folder in the user's home directory
-LOG_DIR = Path.home() / "resume_screener_logs"
+# Logs live alongside the app file itself
+APP_DIR = Path(__file__).parent
+LOG_DIR = APP_DIR / "resume_screener_logs"
 LOG_DIR.mkdir(exist_ok=True)
 
-# File paths
-APP_LOG_FILE = LOG_DIR / "app_activity.log"  # General activity logs (.log)
-LLM_LOG_FILE = LOG_DIR / "llm_calls.jsonl"  # LLM request/response logs (.jsonl)
-RESULTS_EXCEL = (
-    LOG_DIR / "resume_screening_results.xlsx"
-)  # Single persistent Excel file
+APP_LOG_FILE = LOG_DIR / "app_activity.log"
+LLM_LOG_FILE = LOG_DIR / "llm_calls.jsonl"
+RESULTS_EXCEL = LOG_DIR / "resume_screening_results.xlsx"
+
+# Column order for the final Excel — human-readable priority
+EXCEL_COLUMNS = [
+    "Processed At",
+    "Job Description",
+    "Name",
+    "Email",
+    "Phone",
+    "LinkedIn",
+    "Other Socials",
+    "Location",
+    "Current Job Title",
+    "Current Organization",
+    "Total Experience",
+    "Total Jobs",
+    "Average Tenure",
+    "Role in JD",
+    "Resume Match Score",
+    "Resume Summary",
+    "Job History (org-title-jobDuration)",
+]
 
 
 # ========== LOGGING SETUP ==========
 def setup_logger():
-    """File-only logger — nothing goes to the frontend"""
+    """File-only logger with beautified formatting"""
     logger = logging.getLogger("ResumeScreener")
     logger.setLevel(logging.DEBUG)
-    logger.propagate = False  # Prevent leaking to root/streamlit loggers
+    logger.propagate = False
 
     if not logger.handlers:
         handler = RotatingFileHandler(
             APP_LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
         )
-        handler.setFormatter(
-            logging.Formatter(
-                "%(asctime)s | %(levelname)-8s | %(message)s",
-                datefmt="%Y-%m-%d %H:%M:%S",
-            )
+        fmt = (
+            "┌─────────────────────────────────────────────\n"
+            "│ %(asctime)s  [%(levelname)-8s]\n"
+            "│ %(message)s\n"
+            "└─────────────────────────────────────────────"
         )
+        handler.setFormatter(logging.Formatter(fmt, datefmt="%Y-%m-%d %H:%M:%S"))
         logger.addHandler(handler)
 
     return logger
@@ -57,9 +79,16 @@ logger = setup_logger()
 
 
 def log_llm_call(record: dict):
-    """Append a single LLM call record as a JSON line to the JSONL log file"""
+    """Write a beautified JSON record per LLM call to the JSONL file"""
+    beautified = json.dumps(record, ensure_ascii=False, indent=2)
+    separator = "\n" + "=" * 80 + "\n"
     with open(LLM_LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        f.write(separator)
+        f.write(
+            f"  LLM CALL #{record['request_num']}  |  {record['timestamp']}  |  Status: {record['status']}\n"
+        )
+        f.write(separator)
+        f.write(beautified + "\n")
 
 
 # ========== SESSION STATE ==========
@@ -68,7 +97,6 @@ def init_session_state():
         "results": None,
         "df": None,
         "processing_done": False,
-        "history": [],
         "llm_request_count": 0,
     }
     for key, default in defaults.items():
@@ -99,10 +127,8 @@ def extract_text(uploaded_file):
         return extract_text_from_docx(uploaded_file)
     return ""
 
-
-# ========== AI-POWERED EXTRACTION ==========
-def get_gemini_response(prompt):
-    """Call Gemini with full file-based logging"""
+    # ========== AI-POWERED EXTRACTION ==========
+    # def get_gemini_response(prompt):
     st.session_state.llm_request_count += 1
     req_num = st.session_state.llm_request_count
     ts = datetime.now().isoformat()
@@ -126,7 +152,7 @@ def get_gemini_response(prompt):
         text = response.text
 
         call_record.update(status="success", response_length=len(text), response=text)
-        logger.info(f"LLM Request #{req_num} — success ({len(text)} chars)")
+        logger.info(f"LLM Request #{req_num} — success ({len(text)} chars response)")
 
     except Exception as e:
         call_record.update(status="error", error=str(e))
@@ -137,9 +163,21 @@ def get_gemini_response(prompt):
     return text
 
 
+def get_groq_response(prompt):
+    try:
+        response = client.chat.completions.create(
+            model="groq/compound",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"ERROR: {str(e)}"
+
+
 def extract_all_fields_with_ai(resume_text, jd_text):
     logger.info(
-        f"AI extraction start — resume {len(resume_text)} chars, JD {len(jd_text)} chars"
+        f"AI field extraction — resume: {len(resume_text)} chars, JD: {len(jd_text)} chars"
     )
 
     prompt = f"""
@@ -180,7 +218,7 @@ Return JSON in this EXACT format:
     "summary": "Brief professional summary in 2-3 sentences"
 }}
 """
-    response = get_gemini_response(prompt)
+    response = get_groq_response(prompt)
 
     try:
         json_match = re.search(r"\{.*\}", response, re.DOTALL)
@@ -196,8 +234,8 @@ Return JSON in this EXACT format:
 
 
 # ========== BACKUP EXTRACTION ==========
-def extract_name_backup(text):
-    skip_words = {
+_SKIP_WORDS = frozenset(
+    [
         "resume",
         "cv",
         "email",
@@ -207,10 +245,14 @@ def extract_name_backup(text):
         "objective",
         "summary",
         "experience",
-    }
+    ]
+)
+
+
+def extract_name_backup(text):
     for line in text.split("\n")[:8]:
         line = line.strip()
-        if not line or any(kw in line.lower() for kw in skip_words):
+        if not line or any(kw in line.lower() for kw in _SKIP_WORDS):
             continue
         words = line.split()
         if (
@@ -284,23 +326,24 @@ def calculate_average_tenure(total_experience, total_jobs):
 
 
 def _pick(ai_val, backup_val):
-    """Return AI value if valid, otherwise backup"""
     return ai_val if ai_val and ai_val != "N/A" else backup_val
 
 
 # ========== MAIN PROCESSING ==========
-def process_resume_enhanced(resume_file, jd_text, index, batch_timestamp):
-    logger.info(f"Resume #{index}: start — {resume_file.name}")
+def process_resume(resume_file, jd_text, jd_name, batch_ts):
+    logger.info(f"Processing: {resume_file.name}")
 
     try:
         resume_text = extract_text(resume_file)
         if not resume_text or len(resume_text) < 50:
             logger.warning(
-                f"Resume #{index}: extraction failed ({len(resume_text or '')} chars)"
+                f"{resume_file.name}: text extraction failed ({len(resume_text or '')} chars)"
             )
-            return create_error_record(index, "Text extraction failed", batch_timestamp)
+            return _error_record(
+                resume_file.name, "Text extraction failed", jd_name, batch_ts
+            )
 
-        logger.info(f"Resume #{index}: extracted {len(resume_text)} chars")
+        logger.info(f"{resume_file.name}: extracted {len(resume_text)} chars")
 
         ai = extract_all_fields_with_ai(resume_text, jd_text)
         b_name = extract_name_backup(resume_text)
@@ -310,59 +353,46 @@ def process_resume_enhanced(resume_file, jd_text, index, batch_timestamp):
         job_history = ai.get("job_history", "N/A")
         total_jobs = ai.get("total_jobs", count_jobs_from_history(job_history))
         total_exp = _pick(ai.get("total_experience"), b_exp)
-        avg_tenure = calculate_average_tenure(total_exp, total_jobs)
 
         result = {
-            "Processed At": batch_timestamp,
-            "Sr.no": index,
+            "Processed At": batch_ts,
+            "Job Description": jd_name,
             "Name": _pick(ai.get("name"), b_name),
-            "Role in JD": ai.get("role_in_jd", "N/A"),
-            "Current Job Title": ai.get("current_job_title", "N/A"),
-            "Current Organization": ai.get("current_organization", "N/A"),
-            "Location": ai.get("location", "N/A"),
-            "Resume Match Score": ai.get("match_score", "N/A"),
-            "Resume Summary": ai.get("summary", "N/A"),
-            "Phone": _pick(ai.get("phone"), b_phone),
             "Email": _pick(ai.get("email"), b_email),
+            "Phone": _pick(ai.get("phone"), b_phone),
             "LinkedIn": _pick(ai.get("linkedin"), b_linkedin),
             "Other Socials": ai.get("other_socials", "N/A"),
+            "Location": ai.get("location", "N/A"),
+            "Current Job Title": ai.get("current_job_title", "N/A"),
+            "Current Organization": ai.get("current_organization", "N/A"),
             "Total Experience": total_exp,
             "Total Jobs": str(total_jobs)
             if str(total_jobs).isdigit()
             else str(count_jobs_from_history(job_history)),
-            "Average Tenure": avg_tenure,
+            "Average Tenure": calculate_average_tenure(total_exp, total_jobs),
+            "Role in JD": ai.get("role_in_jd", "N/A"),
+            "Resume Match Score": ai.get("match_score", "N/A"),
+            "Resume Summary": ai.get("summary", "N/A"),
             "Job History (org-title-jobDuration)": job_history,
         }
 
         logger.info(
-            f"Resume #{index}: done — Name={result['Name']}, Score={result['Resume Match Score']}"
+            f"{resume_file.name}: done — Name={result['Name']}, Score={result['Resume Match Score']}"
         )
         return result
 
     except Exception as e:
-        logger.error(f"Resume #{index}: error — {e}")
-        return create_error_record(index, f"Processing error: {e}", batch_timestamp)
+        logger.error(f"{resume_file.name}: error — {e}")
+        return _error_record(
+            resume_file.name, f"Processing error: {e}", jd_name, batch_ts
+        )
 
 
-def create_error_record(index, error_msg, batch_timestamp):
-    fields = [
-        "Name",
-        "Role in JD",
-        "Current Job Title",
-        "Current Organization",
-        "Location",
-        "Other Socials",
-        "Total Experience",
-        "Total Jobs",
-        "Average Tenure",
-        "Job History (org-title-jobDuration)",
-        "Phone",
-        "Email",
-        "LinkedIn",
-    ]
-    record = {"Processed At": batch_timestamp, "Sr.no": index}
-    for f in fields:
-        record[f] = "N/A"
+def _error_record(filename, error_msg, jd_name, batch_ts):
+    record = {col: "N/A" for col in EXCEL_COLUMNS}
+    record["Processed At"] = batch_ts
+    record["Job Description"] = jd_name
+    record["Name"] = filename
     record["Resume Match Score"] = "Error"
     record["Resume Summary"] = error_msg
     return record
@@ -370,22 +400,22 @@ def create_error_record(index, error_msg, batch_timestamp):
 
 # ========== EXCEL APPEND ==========
 def append_results_to_excel(results: list):
-    """Append new results to the single persistent Excel file.
-    Creates the file if it doesn't exist; appends rows if it does."""
     new_df = pd.DataFrame(results)
+    # Enforce column order
+    new_df = new_df.reindex(columns=EXCEL_COLUMNS)
 
     if RESULTS_EXCEL.exists():
         try:
             existing_df = pd.read_excel(RESULTS_EXCEL, engine="openpyxl")
             combined_df = pd.concat([existing_df, new_df], ignore_index=True)
         except Exception as e:
-            logger.error(f"Error reading existing Excel: {e}. Overwriting.")
+            logger.error(f"Excel read error: {e} — overwriting")
             combined_df = new_df
     else:
         combined_df = new_df
 
     combined_df.to_excel(RESULTS_EXCEL, index=False, engine="openpyxl")
-    logger.info(f"Excel updated: {RESULTS_EXCEL} — now {len(combined_df)} total rows")
+    logger.info(f"Excel updated: {len(combined_df)} total rows in {RESULTS_EXCEL.name}")
     return combined_df
 
 
@@ -394,22 +424,24 @@ def display_results():
     results = st.session_state.results
     df = st.session_state.df
 
-    st.success(f"✅ Successfully processed {len(results)} resumes!")
+    st.success(
+        f"✅ Successfully processed {len(results)} resumes! Results saved to Excel."
+    )
 
-    st.subheader("📋 Sample Results (First 3 rows)")
-    st.dataframe(df.head(3), width="stretch")
+    st.subheader("📋 Results Preview (First 5 rows)")
+    st.dataframe(df.head(5), width="stretch")
 
     # Stats
     total = len(results)
     successful = sum(1 for r in results if r["Resume Match Score"] != "Error")
-    names_extracted = sum(1 for r in results if r["Name"] != "N/A")
-    tenure_calculated = sum(1 for r in results if r["Average Tenure"] != "N/A")
+    names_ok = sum(1 for r in results if r["Name"] != "N/A")
+    tenure_ok = sum(1 for r in results if r["Average Tenure"] != "N/A")
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("📊 Total Resumes", total)
+    c1.metric("📊 Total", total)
     c2.metric("✅ Successful", successful)
-    c3.metric("👤 Names Extracted", names_extracted)
-    c4.metric("📈 Tenure Calculated", tenure_calculated)
+    c3.metric("👤 Names", names_ok)
+    c4.metric("📈 Tenure", tenure_ok)
 
     # Tenure insights
     tenure_values = []
@@ -423,82 +455,39 @@ def display_results():
     if tenure_values:
         st.subheader("📊 Average Tenure Insights")
         c1, c2, c3 = st.columns(3)
-        avg_t = sum(tenure_values) / len(tenure_values)
-        c1.metric("📊 Overall Average", f"{avg_t:.1f} years")
-        c2.metric("📈 Highest", f"{max(tenure_values):.1f} years")
-        c3.metric("📉 Lowest", f"{min(tenure_values):.1f} years")
+        c1.metric("Overall Avg", f"{sum(tenure_values) / len(tenure_values):.1f} years")
+        c2.metric("Highest", f"{max(tenure_values):.1f} years")
+        c3.metric("Lowest", f"{min(tenure_values):.1f} years")
 
         st.subheader("📊 Tenure Distribution")
-        buckets = [
-            ("0-2 years", 0, 2),
-            ("2-5 years", 2, 5),
-            ("5-10 years", 5, 10),
-            ("10+ years", 10, 999),
-        ]
-        for label, lo, hi in buckets:
-            if lo == 0:
-                count = sum(1 for t in tenure_values if lo <= t <= hi)
-            else:
-                count = sum(1 for t in tenure_values if lo < t <= hi)
-            pct = count / len(tenure_values) * 100
-            st.write(f"• **{label}**: {count} candidates ({pct:.1f}%)")
+        for label, lo, hi in [
+            ("0–2 yrs", 0, 2),
+            ("2–5 yrs", 2, 5),
+            ("5–10 yrs", 5, 10),
+            ("10+ yrs", 10, 999),
+        ]:
+            count = sum(
+                1 for t in tenure_values if (lo <= t <= hi if lo == 0 else lo < t <= hi)
+            )
+            st.write(
+                f"• **{label}**: {count} candidates ({count / len(tenure_values) * 100:.1f}%)"
+            )
 
     with st.expander("📈 View All Results"):
         st.dataframe(df, width="stretch")
 
-    # Downloads — in-memory bytes, no rerun side effects
-    excel_buf = io.BytesIO()
-    df.to_excel(excel_buf, index=False, engine="openpyxl")
-
-    dl_col1, dl_col2 = st.columns(2)
-    with dl_col1:
-        st.download_button(
-            "📥 Download Results (Excel)",
-            data=excel_buf.getvalue(),
-            file_name=f"resume_results_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-    with dl_col2:
-        st.download_button(
-            "📥 Download Results (CSV)",
-            data=df.to_csv(index=False).encode("utf-8"),
-            file_name=f"resume_results_{datetime.now():%Y%m%d_%H%M%S}.csv",
-            mime="text/csv",
-        )
-
     # Quality check
-    st.subheader("🔍 Extraction Quality Check")
-    checks = [
-        ("Names", sum(1 for r in results if r["Name"] != "N/A")),
-        ("Emails", sum(1 for r in results if r["Email"] != "N/A")),
-        ("Phones", sum(1 for r in results if r["Phone"] != "N/A")),
-        ("LinkedIn", sum(1 for r in results if r["LinkedIn"] != "N/A")),
-        ("Tenure", tenure_calculated),
-        (
-            "Job History",
-            sum(
-                1 for r in results if r["Job History (org-title-jobDuration)"] != "N/A"
-            ),
-        ),
-    ]
-    for label, count in checks:
+    st.subheader("🔍 Extraction Quality")
+    for label, key in [
+        ("Names", "Name"),
+        ("Emails", "Email"),
+        ("Phones", "Phone"),
+        ("LinkedIn", "LinkedIn"),
+        ("Tenure", "Average Tenure"),
+        ("Job History", "Job History (org-title-jobDuration)"),
+    ]:
+        count = sum(1 for r in results if r[key] != "N/A")
         st.write(f"• **{label}**: {count}/{total} ({count / total * 100:.1f}%)")
-
-
-def display_history():
-    if not st.session_state.history:
-        st.info("No processing history yet. Run your first batch above!")
-        return
-
-    for i, run in enumerate(reversed(st.session_state.history), 1):
-        idx = len(st.session_state.history) - i + 1
-        with st.expander(
-            f"Run {idx} — {run['timestamp']} — {run['total_resumes']} resumes"
-        ):
-            st.write(
-                f"**Resumes:** {run['total_resumes']} | **Successful:** {run['successful']} | **LLM calls:** {run['llm_calls']}"
-            )
-            st.dataframe(pd.DataFrame(run["results"]).head(5), width="stretch")
 
 
 # ========== STREAMLIT UI ==========
@@ -507,23 +496,19 @@ def main():
     init_session_state()
 
     st.title("🎯 Resume Screener")
-    st.markdown(
-        "**Fine-tuned AI extraction for precise results with Average Tenure Calculation**"
-    )
+    st.markdown("**AI-powered resume parsing with automatic Excel logging**")
 
     # Sidebar
     with st.sidebar:
         st.header("📊 Session Dashboard")
-        st.metric("🤖 Total LLM Calls", st.session_state.llm_request_count)
-        st.metric("📁 Runs Completed", len(st.session_state.history))
+        st.metric("🤖 LLM Calls This Session", st.session_state.llm_request_count)
 
         st.divider()
-        st.subheader("📂 Log Files Location")
+        st.subheader("📂 Files")
         st.code(str(LOG_DIR), language=None)
-        st.caption("Files saved automatically:")
         st.caption("• `app_activity.log` — activity log")
-        st.caption("• `llm_calls.jsonl` — all LLM I/O")
-        st.caption("• `resume_screening_results.xlsx` — cumulative results")
+        st.caption("• `llm_calls.jsonl` — LLM input/output")
+        st.caption("• `resume_screening_results.xlsx` — all results")
 
         if RESULTS_EXCEL.exists():
             try:
@@ -533,7 +518,7 @@ def main():
                 pass
 
         st.divider()
-        if st.button("🗑️ Clear Current Results"):
+        if st.button("🗑️ Clear Screen"):
             st.session_state.results = None
             st.session_state.df = None
             st.session_state.processing_done = False
@@ -545,80 +530,63 @@ def main():
         jd_file = st.file_uploader("📋 Upload Job Description", type=["pdf", "docx"])
     with col2:
         resume_files = st.file_uploader(
-            "📄 Upload Resume Files", type=["pdf", "docx"], accept_multiple_files=True
+            "📄 Upload Resumes", type=["pdf", "docx"], accept_multiple_files=True
         )
 
     # Processing
     if st.button("🚀 Start Processing", type="primary"):
         if not jd_file or not resume_files:
-            st.error("⚠️ Please upload both JD and resume files")
+            st.error("⚠️ Please upload both a JD and at least one resume")
         else:
             jd_text = extract_text(jd_file)
             if not jd_text:
                 st.error("❌ Failed to extract JD text")
             else:
+                jd_name = jd_file.name
                 batch_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                logger.info(f"{'=' * 60}")
                 logger.info(
-                    f"=== NEW RUN: {len(resume_files)} resumes, JD: {jd_file.name}, batch: {batch_ts} ==="
+                    f"NEW RUN — {len(resume_files)} resumes | JD: {jd_name} | {batch_ts}"
                 )
-                llm_before = st.session_state.llm_request_count
+                logger.info(f"{'=' * 60}")
+
                 results = []
 
-                with st.status(
-                    "🚀 Orchestrating AI Extraction...", expanded=True
-                ) as status:
+                with st.status("🚀 Processing resumes...", expanded=True) as status:
                     progress = st.progress(0)
                     file_display = st.empty()
 
                     for idx, rf in enumerate(resume_files, 1):
                         file_display.markdown(
-                            f"**🔍 Analyzing File {idx} of {len(resume_files)}:** `{rf.name}`"
+                            f"**🔍 [{idx}/{len(resume_files)}]** `{rf.name}`"
                         )
-                        results.append(
-                            process_resume_enhanced(rf, jd_text, idx, batch_ts)
-                        )
+                        results.append(process_resume(rf, jd_text, jd_name, batch_ts))
                         progress.progress(idx / len(resume_files))
 
                     file_display.empty()
                     status.update(
-                        label="✅ AI Analysis Complete!",
-                        state="complete",
-                        expanded=False,
+                        label="✅ Complete!", state="complete", expanded=False
                     )
 
-                # Persist to session state
+                # Save
                 st.session_state.results = results
-                st.session_state.df = pd.DataFrame(results)
+                st.session_state.df = pd.DataFrame(results).reindex(
+                    columns=EXCEL_COLUMNS
+                )
                 st.session_state.processing_done = True
 
-                # Append to persistent Excel
                 append_results_to_excel(results)
 
-                # Save to in-memory history
-                llm_this_run = st.session_state.llm_request_count - llm_before
-                st.session_state.history.append(
-                    {
-                        "timestamp": batch_ts,
-                        "total_resumes": len(results),
-                        "successful": sum(
-                            1 for r in results if r["Resume Match Score"] != "Error"
-                        ),
-                        "llm_calls": llm_this_run,
-                        "results": results,
-                    }
+                successful = sum(
+                    1 for r in results if r["Resume Match Score"] != "Error"
                 )
                 logger.info(
-                    f"=== RUN COMPLETE: {len(results)} resumes, {llm_this_run} LLM calls ==="
+                    f"RUN COMPLETE — {successful}/{len(results)} successful | LLM calls: {st.session_state.llm_request_count}"
                 )
 
-    # Display results if available
+    # Persistent display
     if st.session_state.processing_done and st.session_state.results:
         display_results()
-
-    # History
-    st.divider()
-    with st.expander("📜 Processing History"):
-        display_history()
 
 
 if __name__ == "__main__":
