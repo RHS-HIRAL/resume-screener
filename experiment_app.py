@@ -63,12 +63,7 @@ def setup_logger():
         handler = RotatingFileHandler(
             APP_LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
         )
-        fmt = (
-            "┌─────────────────────────────────────────────\n"
-            "│ %(asctime)s  [%(levelname)-8s]\n"
-            "│ %(message)s\n"
-            "└─────────────────────────────────────────────"
-        )
+        fmt = "%(asctime)s  %(levelname)-8s  %(message)s"
         handler.setFormatter(logging.Formatter(fmt, datefmt="%Y-%m-%d %H:%M:%S"))
         lgr.addHandler(handler)
     return lgr
@@ -77,15 +72,23 @@ def setup_logger():
 logger = setup_logger()
 
 
-def log_llm_call(record: dict):
-    separator = "=" * 80
+def log_batch_separator(batch_ts, jd_name, resume_count):
+    """Write a single batch header to both log files"""
+    header = f"BATCH {batch_ts} | JD: {jd_name} | Resumes: {resume_count}"
+    divider = "-" * len(header)
+
+    logger.info(divider)
+    logger.info(header)
+    logger.info(divider)
+
     with open(LLM_LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(f"\n{separator}\n")
-        f.write(
-            f"  LLM CALL #{record['request_num']}  |  {record['timestamp']}  |  Provider: {record['provider']}  |  Status: {record['status']}\n"
-        )
-        f.write(f"{separator}\n")
-        f.write(json.dumps(record, ensure_ascii=False, indent=2) + "\n")
+        f.write(f"\n--- {header} ---\n")
+
+
+def log_llm_call(record: dict):
+    """Append one compact JSON line per LLM call — no per-call separators"""
+    with open(LLM_LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 # ========== SESSION STATE ==========
@@ -240,7 +243,7 @@ Return JSON in this EXACT format:
     "total_experience": "X years",
     "job_history": "Company1 - Title1 - Duration1 | Company2 - Title2 - Duration2",
     "total_jobs": "Number of jobs",
-    "match_score": "Percentage of match with JD (0-100%)",
+    "match_score": "Percentage of resume candidate match with JD (0-100%)",
     "summary": "Brief professional summary in 2-3 sentences"
 }}"""
 
@@ -576,11 +579,7 @@ def main():
             else:
                 jd_name = jd_file.name
                 batch_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                logger.info(f"{'=' * 60}")
-                logger.info(
-                    f"NEW RUN — {len(resume_files)} resumes | JD: {jd_name} | {batch_ts}"
-                )
-                logger.info(f"{'=' * 60}")
+                log_batch_separator(batch_ts, jd_name, len(resume_files))
 
                 results = []
                 with st.status("🚀 Processing...", expanded=True) as status:
