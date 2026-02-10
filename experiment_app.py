@@ -13,15 +13,18 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from groq import Groq
 
-# Load environment variables
+# ========== ENVIRONMENT & API SETUP ==========
 load_dotenv()
+
+# Gemini
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-api_key = os.getenv("GROQ_API_KEY")
-client = Groq(api_key=api_key)
+
+# Groq — primary and alternate keys
+GROQ_KEY_PRIMARY = os.getenv("GROQ_API_KEY")
+GROQ_KEY_ALT = os.getenv("GROQ_API_KEY_ALT")
 
 
 # ========== LOG DIRECTORY SETUP ==========
-# Logs live alongside the app file itself
 APP_DIR = Path(__file__).parent
 LOG_DIR = APP_DIR / "resume_screener_logs"
 LOG_DIR.mkdir(exist_ok=True)
@@ -30,7 +33,6 @@ APP_LOG_FILE = LOG_DIR / "app_activity.log"
 LLM_LOG_FILE = LOG_DIR / "llm_calls.jsonl"
 RESULTS_EXCEL = LOG_DIR / "resume_screening_results.xlsx"
 
-# Column order for the final Excel — human-readable priority
 EXCEL_COLUMNS = [
     "Processed At",
     "Job Description",
@@ -52,14 +54,12 @@ EXCEL_COLUMNS = [
 ]
 
 
-# ========== LOGGING SETUP ==========
+# ========== LOGGING ==========
 def setup_logger():
-    """File-only logger with beautified formatting"""
-    logger = logging.getLogger("ResumeScreener")
-    logger.setLevel(logging.DEBUG)
-    logger.propagate = False
-
-    if not logger.handlers:
+    lgr = logging.getLogger("ResumeScreener")
+    lgr.setLevel(logging.DEBUG)
+    lgr.propagate = False
+    if not lgr.handlers:
         handler = RotatingFileHandler(
             APP_LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
         )
@@ -70,36 +70,32 @@ def setup_logger():
             "└─────────────────────────────────────────────"
         )
         handler.setFormatter(logging.Formatter(fmt, datefmt="%Y-%m-%d %H:%M:%S"))
-        logger.addHandler(handler)
-
-    return logger
+        lgr.addHandler(handler)
+    return lgr
 
 
 logger = setup_logger()
 
 
 def log_llm_call(record: dict):
-    """Write a beautified JSON record per LLM call to the JSONL file"""
-    beautified = json.dumps(record, ensure_ascii=False, indent=2)
-    separator = "\n" + "=" * 80 + "\n"
+    separator = "=" * 80
     with open(LLM_LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(separator)
+        f.write(f"\n{separator}\n")
         f.write(
-            f"  LLM CALL #{record['request_num']}  |  {record['timestamp']}  |  Status: {record['status']}\n"
+            f"  LLM CALL #{record['request_num']}  |  {record['timestamp']}  |  Provider: {record['provider']}  |  Status: {record['status']}\n"
         )
-        f.write(separator)
-        f.write(beautified + "\n")
+        f.write(f"{separator}\n")
+        f.write(json.dumps(record, ensure_ascii=False, indent=2) + "\n")
 
 
 # ========== SESSION STATE ==========
 def init_session_state():
-    defaults = {
+    for key, default in {
         "results": None,
         "df": None,
         "processing_done": False,
         "llm_request_count": 0,
-    }
-    for key, default in defaults.items():
+    }.items():
         if key not in st.session_state:
             st.session_state[key] = default
 
@@ -127,61 +123,91 @@ def extract_text(uploaded_file):
         return extract_text_from_docx(uploaded_file)
     return ""
 
-    # ========== AI-POWERED EXTRACTION ==========
-    # def get_gemini_response(prompt):
+
+# ========== LLM PROVIDERS ==========
+def _call_gemini(prompt):
+    """Call Google Gemini API"""
+    model = genai.GenerativeModel("gemini-2.5-flash")
+    response = model.generate_content(prompt)
+    return response.text
+
+
+def _call_groq(prompt, api_key):
+    """Call Groq API with the given key"""
+    client = Groq(api_key=api_key)
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.1,
+    )
+    return response.choices[0].message.content
+
+
+# Fallback chain: (provider_name, callable)
+def _build_fallback_chain():
+    chain = [("Gemini", lambda p: _call_gemini(p))]
+    if GROQ_KEY_PRIMARY:
+        chain.append(("Groq-Primary", lambda p: _call_groq(p, GROQ_KEY_PRIMARY)))
+    if GROQ_KEY_ALT:
+        chain.append(("Groq-Alt", lambda p: _call_groq(p, GROQ_KEY_ALT)))
+    return chain
+
+
+FALLBACK_CHAIN = _build_fallback_chain()
+
+
+def get_llm_response(prompt):
+    """Try each provider in order until one succeeds. Logs every attempt."""
     st.session_state.llm_request_count += 1
     req_num = st.session_state.llm_request_count
     ts = datetime.now().isoformat()
 
-    logger.info(f"LLM Request #{req_num} — sending {len(prompt)} chars")
+    errors = []
 
-    call_record = {
-        "request_num": req_num,
-        "timestamp": ts,
-        "prompt_length": len(prompt),
-        "prompt": prompt,
-        "status": "pending",
-        "response_length": 0,
-        "response": "",
-        "error": None,
-    }
+    for provider_name, call_fn in FALLBACK_CHAIN:
+        logger.info(f"LLM #{req_num} — trying {provider_name} ({len(prompt)} chars)")
 
-    try:
-        model = genai.GenerativeModel("gemini-2.5-flash")
-        response = model.generate_content(prompt)
-        text = response.text
+        record = {
+            "request_num": req_num,
+            "timestamp": ts,
+            "provider": provider_name,
+            "prompt_length": len(prompt),
+            "prompt": prompt,
+            "status": "pending",
+            "response_length": 0,
+            "response": "",
+            "error": None,
+        }
 
-        call_record.update(status="success", response_length=len(text), response=text)
-        logger.info(f"LLM Request #{req_num} — success ({len(text)} chars response)")
+        try:
+            text = call_fn(prompt)
 
-    except Exception as e:
-        call_record.update(status="error", error=str(e))
-        logger.error(f"LLM Request #{req_num} — ERROR: {e}")
-        text = f"ERROR: {e}"
+            record.update(status="success", response_length=len(text), response=text)
+            logger.info(f"LLM #{req_num} — {provider_name} success ({len(text)} chars)")
+            log_llm_call(record)
+            return text
 
-    log_llm_call(call_record)
-    return text
+        except Exception as e:
+            err_msg = f"{provider_name}: {e}"
+            errors.append(err_msg)
+            record.update(status="error", error=str(e))
+            logger.warning(f"LLM #{req_num} — {provider_name} failed: {e}")
+            log_llm_call(record)
+            continue
 
-
-def get_groq_response(prompt):
-    try:
-        response = client.chat.completions.create(
-            model="groq/compound",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        return f"ERROR: {str(e)}"
+    # All providers failed
+    all_errors = " | ".join(errors)
+    logger.error(f"LLM #{req_num} — ALL PROVIDERS FAILED: {all_errors}")
+    return f"ERROR: All providers failed — {all_errors}"
 
 
+# ========== AI FIELD EXTRACTION ==========
 def extract_all_fields_with_ai(resume_text, jd_text):
     logger.info(
-        f"AI field extraction — resume: {len(resume_text)} chars, JD: {len(jd_text)} chars"
+        f"AI extraction — resume: {len(resume_text)} chars, JD: {len(jd_text)} chars"
     )
 
-    prompt = f"""
-You are an expert resume parser. Extract the following information from this resume with 100% accuracy.
+    prompt = f"""You are an expert resume parser. Extract the following information from this resume with 100% accuracy.
 
 CRITICAL INSTRUCTIONS:
 1. Return ONLY valid JSON in the exact format shown below
@@ -214,11 +240,15 @@ Return JSON in this EXACT format:
     "total_experience": "X years",
     "job_history": "Company1 - Title1 - Duration1 | Company2 - Title2 - Duration2",
     "total_jobs": "Number of jobs",
-    "match_score": "XX%",
+    "match_score": "Percentage of match with JD (0-100%)",
     "summary": "Brief professional summary in 2-3 sentences"
-}}
-"""
-    response = get_groq_response(prompt)
+}}"""
+
+    response = get_llm_response(prompt)
+
+    if response.startswith("ERROR:"):
+        logger.error(f"AI extraction failed: {response}")
+        return {}
 
     try:
         json_match = re.search(r"\{.*\}", response, re.DOTALL)
@@ -226,7 +256,7 @@ Return JSON in this EXACT format:
             data = json.loads(json_match.group(0))
             logger.info(f"AI extraction success — {len(data)} fields parsed")
             return data
-    except Exception as e:
+    except (json.JSONDecodeError, ValueError) as e:
         logger.error(f"JSON parsing error: {e}")
         st.error(f"JSON parsing error: {e}")
 
@@ -254,9 +284,8 @@ def extract_name_backup(text):
         line = line.strip()
         if not line or any(kw in line.lower() for kw in _SKIP_WORDS):
             continue
-        words = line.split()
         if (
-            2 <= len(words) <= 4
+            2 <= len(line.split()) <= 4
             and re.match(r"^[A-Za-z\s\.]+$", line)
             and not line.isupper()
         ):
@@ -291,34 +320,32 @@ def extract_experience_backup(text):
         r"(\d+(?:\.\d+)?)\s*(?:years?|yrs?)\s*(?:of\s*)?(?:experience|exp)",
     ]:
         m = re.search(pat, text, re.IGNORECASE)
-        if m:
-            exp = float(m.group(1))
-            if 0 <= exp <= 50:
-                return f"{exp} years"
+        if m and 0 <= float(m.group(1)) <= 50:
+            return f"{float(m.group(1))} years"
     return "N/A"
 
 
 # ========== HELPERS ==========
-def count_jobs_from_history(job_history):
+def _count_jobs(job_history):
     if not job_history or job_history == "N/A":
         return 0
     return len([e for e in job_history.split(" | ") if e.strip()])
 
 
-def extract_numeric_experience(exp_str):
+def _extract_years(exp_str):
     if not exp_str or exp_str == "N/A":
-        return 0
+        return 0.0
     m = re.search(r"(\d+(?:\.\d+)?)", exp_str)
-    return float(m.group(1)) if m else 0
+    return float(m.group(1)) if m else 0.0
 
 
-def calculate_average_tenure(total_experience, total_jobs):
+def _avg_tenure(total_exp, total_jobs):
     try:
-        years = extract_numeric_experience(total_experience)
+        years = _extract_years(total_exp)
         jobs = (
             int(total_jobs)
             if str(total_jobs).isdigit()
-            else count_jobs_from_history(str(total_jobs))
+            else _count_jobs(str(total_jobs))
         )
         return f"{years / jobs:.1f} years" if years > 0 and jobs > 0 else "N/A"
     except Exception:
@@ -329,7 +356,7 @@ def _pick(ai_val, backup_val):
     return ai_val if ai_val and ai_val != "N/A" else backup_val
 
 
-# ========== MAIN PROCESSING ==========
+# ========== RESUME PROCESSING ==========
 def process_resume(resume_file, jd_text, jd_name, batch_ts):
     logger.info(f"Processing: {resume_file.name}")
 
@@ -337,7 +364,7 @@ def process_resume(resume_file, jd_text, jd_name, batch_ts):
         resume_text = extract_text(resume_file)
         if not resume_text or len(resume_text) < 50:
             logger.warning(
-                f"{resume_file.name}: text extraction failed ({len(resume_text or '')} chars)"
+                f"{resume_file.name}: extraction failed ({len(resume_text or '')} chars)"
             )
             return _error_record(
                 resume_file.name, "Text extraction failed", jd_name, batch_ts
@@ -351,7 +378,7 @@ def process_resume(resume_file, jd_text, jd_name, batch_ts):
         b_exp = extract_experience_backup(resume_text)
 
         job_history = ai.get("job_history", "N/A")
-        total_jobs = ai.get("total_jobs", count_jobs_from_history(job_history))
+        total_jobs = ai.get("total_jobs", _count_jobs(job_history))
         total_exp = _pick(ai.get("total_experience"), b_exp)
 
         result = {
@@ -368,8 +395,8 @@ def process_resume(resume_file, jd_text, jd_name, batch_ts):
             "Total Experience": total_exp,
             "Total Jobs": str(total_jobs)
             if str(total_jobs).isdigit()
-            else str(count_jobs_from_history(job_history)),
-            "Average Tenure": calculate_average_tenure(total_exp, total_jobs),
+            else str(_count_jobs(job_history)),
+            "Average Tenure": _avg_tenure(total_exp, total_jobs),
             "Role in JD": ai.get("role_in_jd", "N/A"),
             "Resume Match Score": ai.get("match_score", "N/A"),
             "Resume Summary": ai.get("summary", "N/A"),
@@ -390,19 +417,21 @@ def process_resume(resume_file, jd_text, jd_name, batch_ts):
 
 def _error_record(filename, error_msg, jd_name, batch_ts):
     record = {col: "N/A" for col in EXCEL_COLUMNS}
-    record["Processed At"] = batch_ts
-    record["Job Description"] = jd_name
-    record["Name"] = filename
-    record["Resume Match Score"] = "Error"
-    record["Resume Summary"] = error_msg
+    record.update(
+        {
+            "Processed At": batch_ts,
+            "Job Description": jd_name,
+            "Name": filename,
+            "Resume Match Score": "Error",
+            "Resume Summary": error_msg,
+        }
+    )
     return record
 
 
 # ========== EXCEL APPEND ==========
 def append_results_to_excel(results: list):
-    new_df = pd.DataFrame(results)
-    # Enforce column order
-    new_df = new_df.reindex(columns=EXCEL_COLUMNS)
+    new_df = pd.DataFrame(results).reindex(columns=EXCEL_COLUMNS)
 
     if RESULTS_EXCEL.exists():
         try:
@@ -415,24 +444,21 @@ def append_results_to_excel(results: list):
         combined_df = new_df
 
     combined_df.to_excel(RESULTS_EXCEL, index=False, engine="openpyxl")
-    logger.info(f"Excel updated: {len(combined_df)} total rows in {RESULTS_EXCEL.name}")
+    logger.info(f"Excel updated: {len(combined_df)} total rows")
     return combined_df
 
 
-# ========== RESULTS DISPLAY ==========
+# ========== DISPLAY ==========
 def display_results():
     results = st.session_state.results
     df = st.session_state.df
+    total = len(results)
 
-    st.success(
-        f"✅ Successfully processed {len(results)} resumes! Results saved to Excel."
-    )
+    st.success(f"✅ Processed {total} resumes — results saved to Excel.")
 
-    st.subheader("📋 Results Preview (First 5 rows)")
+    st.subheader("📋 Results Preview")
     st.dataframe(df.head(5), width="stretch")
 
-    # Stats
-    total = len(results)
     successful = sum(1 for r in results if r["Resume Match Score"] != "Error")
     names_ok = sum(1 for r in results if r["Name"] != "N/A")
     tenure_ok = sum(1 for r in results if r["Average Tenure"] != "N/A")
@@ -453,13 +479,12 @@ def display_results():
                 pass
 
     if tenure_values:
-        st.subheader("📊 Average Tenure Insights")
+        st.subheader("📊 Tenure Insights")
         c1, c2, c3 = st.columns(3)
-        c1.metric("Overall Avg", f"{sum(tenure_values) / len(tenure_values):.1f} years")
-        c2.metric("Highest", f"{max(tenure_values):.1f} years")
-        c3.metric("Lowest", f"{min(tenure_values):.1f} years")
+        c1.metric("Average", f"{sum(tenure_values) / len(tenure_values):.1f} yrs")
+        c2.metric("Highest", f"{max(tenure_values):.1f} yrs")
+        c3.metric("Lowest", f"{min(tenure_values):.1f} yrs")
 
-        st.subheader("📊 Tenure Distribution")
         for label, lo, hi in [
             ("0–2 yrs", 0, 2),
             ("2–5 yrs", 2, 5),
@@ -470,13 +495,12 @@ def display_results():
                 1 for t in tenure_values if (lo <= t <= hi if lo == 0 else lo < t <= hi)
             )
             st.write(
-                f"• **{label}**: {count} candidates ({count / len(tenure_values) * 100:.1f}%)"
+                f"• **{label}**: {count} ({count / len(tenure_values) * 100:.1f}%)"
             )
 
     with st.expander("📈 View All Results"):
         st.dataframe(df, width="stretch")
 
-    # Quality check
     st.subheader("🔍 Extraction Quality")
     for label, key in [
         ("Names", "Name"),
@@ -490,7 +514,7 @@ def display_results():
         st.write(f"• **{label}**: {count}/{total} ({count / total * 100:.1f}%)")
 
 
-# ========== STREAMLIT UI ==========
+# ========== MAIN UI ==========
 def main():
     st.set_page_config(page_title="🎯 Resume Screener", layout="wide")
     init_session_state()
@@ -500,20 +524,28 @@ def main():
 
     # Sidebar
     with st.sidebar:
-        st.header("📊 Session Dashboard")
-        st.metric("🤖 LLM Calls This Session", st.session_state.llm_request_count)
+        st.header("📊 Dashboard")
+        st.metric("🤖 LLM Calls", st.session_state.llm_request_count)
+
+        # Show which providers are configured
+        providers = ["Gemini"]
+        if GROQ_KEY_PRIMARY:
+            providers.append("Groq")
+        if GROQ_KEY_ALT:
+            providers.append("Groq-Alt")
+        st.caption(f"**Providers:** {' → '.join(providers)}")
 
         st.divider()
         st.subheader("📂 Files")
         st.code(str(LOG_DIR), language=None)
-        st.caption("• `app_activity.log` — activity log")
-        st.caption("• `llm_calls.jsonl` — LLM input/output")
-        st.caption("• `resume_screening_results.xlsx` — all results")
+        st.caption("• `app_activity.log`")
+        st.caption("• `llm_calls.jsonl`")
+        st.caption("• `resume_screening_results.xlsx`")
 
         if RESULTS_EXCEL.exists():
             try:
                 row_count = len(pd.read_excel(RESULTS_EXCEL, engine="openpyxl"))
-                st.metric("📊 Total Rows in Excel", row_count)
+                st.metric("📊 Total Excel Rows", row_count)
             except Exception:
                 pass
 
@@ -524,19 +556,19 @@ def main():
             st.session_state.processing_done = False
             st.rerun()
 
-    # File upload
+    # Upload
     col1, col2 = st.columns(2)
     with col1:
-        jd_file = st.file_uploader("📋 Upload Job Description", type=["pdf", "docx"])
+        jd_file = st.file_uploader("📋 Job Description", type=["pdf", "docx"])
     with col2:
         resume_files = st.file_uploader(
-            "📄 Upload Resumes", type=["pdf", "docx"], accept_multiple_files=True
+            "📄 Resumes", type=["pdf", "docx"], accept_multiple_files=True
         )
 
-    # Processing
+    # Process
     if st.button("🚀 Start Processing", type="primary"):
         if not jd_file or not resume_files:
-            st.error("⚠️ Please upload both a JD and at least one resume")
+            st.error("⚠️ Upload both a JD and at least one resume")
         else:
             jd_text = extract_text(jd_file)
             if not jd_text:
@@ -551,8 +583,7 @@ def main():
                 logger.info(f"{'=' * 60}")
 
                 results = []
-
-                with st.status("🚀 Processing resumes...", expanded=True) as status:
+                with st.status("🚀 Processing...", expanded=True) as status:
                     progress = st.progress(0)
                     file_display = st.empty()
 
@@ -568,7 +599,6 @@ def main():
                         label="✅ Complete!", state="complete", expanded=False
                     )
 
-                # Save
                 st.session_state.results = results
                 st.session_state.df = pd.DataFrame(results).reindex(
                     columns=EXCEL_COLUMNS
@@ -577,14 +607,11 @@ def main():
 
                 append_results_to_excel(results)
 
-                successful = sum(
-                    1 for r in results if r["Resume Match Score"] != "Error"
-                )
+                ok = sum(1 for r in results if r["Resume Match Score"] != "Error")
                 logger.info(
-                    f"RUN COMPLETE — {successful}/{len(results)} successful | LLM calls: {st.session_state.llm_request_count}"
+                    f"RUN COMPLETE — {ok}/{len(results)} successful | LLM calls: {st.session_state.llm_request_count}"
                 )
 
-    # Persistent display
     if st.session_state.processing_done and st.session_state.results:
         display_results()
 
