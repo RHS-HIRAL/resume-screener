@@ -1,28 +1,3 @@
-"""
-Resume Pipeline — Single-File Application (app.py)
-
-Combines: config, auth, email_fetcher, sharepoint_uploader, notifications, main
-
-Workflow:
-  1. Authenticate with Entra ID (client credentials)
-  2. Fetch emails from the last 24 hours matching "New application received"
-  3. Parse each email → extract Name, Email, Phone, Job Role, Job ID, Resume URL
-     (no PDF content is parsed — only the structured fields from the email body)
-  4. Download the resume PDF as-is from the URL
-  5. Rename: {Name}_{JobID}_{Date}.pdf
-  6. Upload to SharePoint under Resumes/{JobID}_{JobRole}/ subfolder
-  7. Tag metadata columns: CandidateName, CandidateEmail, CandidatePhone, JobID, JobRole
-  8. Send summary notification to Teams
-  9. Log everything to pipeline.log
-
-Run:     python app.py
-Schedule: cron / Task Scheduler / Azure Function Timer Trigger
-"""
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  IMPORTS
-# ═══════════════════════════════════════════════════════════════════════════════
-
 import os
 import sys
 import json
@@ -39,11 +14,6 @@ from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 
 load_dotenv()
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  CONFIG (class namespace so that `config.X` references work everywhere)
-# ═══════════════════════════════════════════════════════════════════════════════
 
 
 class config:
