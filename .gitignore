@@ -3,4 +3,5 @@
 old_resume_screener_logs
 resume_screener_logs
 __pycache__
-outlook_resume_pipeline/logs
+outlook_resume_jd_pipeline/logs
+jd_rag_pipeline/downloads
