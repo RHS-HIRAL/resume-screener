@@ -1,3 +1,6 @@
 .env
 .venv
+old_resume_screener_logs
 resume_screener_logs
+__pycache__
+outlook_resume_pipeline/logs

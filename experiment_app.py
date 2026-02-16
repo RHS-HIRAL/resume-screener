@@ -8,18 +8,14 @@ import re
 from docx import Document
 import pandas as pd
 from datetime import datetime
-import logging
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from groq import Groq
 
 # ========== ENVIRONMENT & API SETUP ==========
 load_dotenv()
 
-# Gemini
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
-# Groq — primary and alternate keys
 GROQ_KEY_PRIMARY = os.getenv("GROQ_API_KEY")
 GROQ_KEY_ALT = os.getenv("GROQ_API_KEY_ALT")
 
@@ -29,66 +25,42 @@ APP_DIR = Path(__file__).parent
 LOG_DIR = APP_DIR / "resume_screener_logs"
 LOG_DIR.mkdir(exist_ok=True)
 
-APP_LOG_FILE = LOG_DIR / "app_activity.log"
 LLM_LOG_FILE = LOG_DIR / "llm_calls.jsonl"
 RESULTS_EXCEL = LOG_DIR / "resume_screening_results.xlsx"
 
 EXCEL_COLUMNS = [
-    "Processed At",
-    "Job Description",
     "Name",
+    "Resume Match Score",
     "Email",
     "Phone",
     "LinkedIn",
-    "Other Socials",
-    "Location",
     "Current Job Title",
     "Current Organization",
     "Total Experience",
     "Total Jobs",
     "Average Tenure",
+    "Location",
     "Role in JD",
-    "Resume Match Score",
     "Resume Summary",
     "Job History (org-title-jobDuration)",
+    "Other Socials",
+    "Processed At",
+    "Job Description",
 ]
 
 
-# ========== LOGGING ==========
-def setup_logger():
-    lgr = logging.getLogger("ResumeScreener")
-    lgr.setLevel(logging.DEBUG)
-    lgr.propagate = False
-    if not lgr.handlers:
-        handler = RotatingFileHandler(
-            APP_LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
-        )
-        fmt = "%(asctime)s  %(levelname)-8s  %(message)s"
-        handler.setFormatter(logging.Formatter(fmt, datefmt="%Y-%m-%d %H:%M:%S"))
-        lgr.addHandler(handler)
-    return lgr
-
-
-logger = setup_logger()
+# ========== LOGGING (errors/failures only) ==========
+def log_llm_failure(record: dict):
+    """Write only failures/fallbacks to the JSONL log"""
+    with open(LLM_LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def log_batch_separator(batch_ts, jd_name, resume_count):
-    """Write a single batch header to both log files"""
-    header = f"BATCH {batch_ts} | JD: {jd_name} | Resumes: {resume_count}"
-    divider = "-" * len(header)
-
-    logger.info(divider)
-    logger.info(header)
-    logger.info(divider)
-
     with open(LLM_LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(f"\n--- {header} ---\n")
-
-
-def log_llm_call(record: dict):
-    """Append one compact JSON line per LLM call — no per-call separators"""
-    with open(LLM_LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        f.write(
+            f"\n--- BATCH {batch_ts} | JD: {jd_name} | Resumes: {resume_count} ---\n"
+        )
 
 
 # ========== SESSION STATE ==========
@@ -98,6 +70,9 @@ def init_session_state():
         "df": None,
         "processing_done": False,
         "llm_request_count": 0,
+        "pending_conflicts": None,
+        "non_conflict_results": None,
+        "conflict_resolved": False,
     }.items():
         if key not in st.session_state:
             st.session_state[key] = default
@@ -129,30 +104,40 @@ def extract_text(uploaded_file):
 
 # ========== LLM PROVIDERS ==========
 def _call_gemini(prompt):
-    """Call Google Gemini API"""
     model = genai.GenerativeModel("gemini-2.5-flash")
     response = model.generate_content(prompt)
     return response.text
 
 
-def _call_groq(prompt, api_key):
-    """Call Groq API with the given key"""
+def _call_groq(prompt, api_key, model_name):
     client = Groq(api_key=api_key)
     response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model=model_name,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.1,
     )
-    return response.choices[0].message.content
+    usage = response.usage
+    tokens = {
+        "input": usage.prompt_tokens if usage else None,
+        "output": usage.completion_tokens if usage else None,
+        "total": usage.total_tokens if usage else None,
+    }
+    return response.choices[0].message.content, tokens
 
 
-# Fallback chain: (provider_name, callable)
 def _build_fallback_chain():
-    chain = [("Gemini", lambda p: _call_gemini(p))]
+    """Gemini → Groq-Primary/compound → Groq-Alt/compound → Groq-Primary/llama → Groq-Alt/llama"""
+    chain = [("Gemini", None, None)]  # (label, api_key, model)
     if GROQ_KEY_PRIMARY:
-        chain.append(("Groq-Primary", lambda p: _call_groq(p, GROQ_KEY_PRIMARY)))
+        chain.append(("Groq-Primary/compound", GROQ_KEY_PRIMARY, "groq/compound"))
     if GROQ_KEY_ALT:
-        chain.append(("Groq-Alt", lambda p: _call_groq(p, GROQ_KEY_ALT)))
+        chain.append(("Groq-Alt/compound", GROQ_KEY_ALT, "groq/compound"))
+    if GROQ_KEY_PRIMARY:
+        chain.append(
+            ("Groq-Primary/llama", GROQ_KEY_PRIMARY, "llama-3.3-70b-versatile")
+        )
+    if GROQ_KEY_ALT:
+        chain.append(("Groq-Alt/llama", GROQ_KEY_ALT, "llama-3.3-70b-versatile"))
     return chain
 
 
@@ -160,56 +145,67 @@ FALLBACK_CHAIN = _build_fallback_chain()
 
 
 def get_llm_response(prompt):
-    """Try each provider in order until one succeeds. Logs every attempt."""
     st.session_state.llm_request_count += 1
     req_num = st.session_state.llm_request_count
     ts = datetime.now().isoformat()
+    prompt_chars = len(prompt)
 
-    errors = []
-
-    for provider_name, call_fn in FALLBACK_CHAIN:
-        logger.info(f"LLM #{req_num} — trying {provider_name} ({len(prompt)} chars)")
-
-        record = {
-            "request_num": req_num,
-            "timestamp": ts,
-            "provider": provider_name,
-            "prompt_length": len(prompt),
-            "prompt": prompt,
-            "status": "pending",
-            "response_length": 0,
-            "response": "",
-            "error": None,
-        }
-
+    for label, api_key, model_name in FALLBACK_CHAIN:
         try:
-            text = call_fn(prompt)
-
-            record.update(status="success", response_length=len(text), response=text)
-            logger.info(f"LLM #{req_num} — {provider_name} success ({len(text)} chars)")
-            log_llm_call(record)
-            return text
+            if label == "Gemini":
+                text = _call_gemini(prompt)
+                return text
+            else:
+                text, _ = _call_groq(prompt, api_key, model_name)
+                return text
 
         except Exception as e:
-            err_msg = f"{provider_name}: {e}"
-            errors.append(err_msg)
-            record.update(status="error", error=str(e))
-            logger.warning(f"LLM #{req_num} — {provider_name} failed: {e}")
-            log_llm_call(record)
+            # Estimate tokens for failed calls (rough: 1 token ≈ 4 chars)
+            est_input = prompt_chars // 4
+            token_info = {"input_est": est_input, "output": 0, "total_est": est_input}
+
+            # Try to get real token counts from Groq errors if available
+            if label != "Gemini":
+                try:
+                    # Some Groq errors carry usage in the response
+                    if hasattr(e, "body") and isinstance(e.body, dict):
+                        usage = e.body.get("usage", {})
+                        if usage:
+                            token_info = {
+                                "input": usage.get("prompt_tokens", est_input),
+                                "output": usage.get("completion_tokens", 0),
+                                "total": usage.get("total_tokens", est_input),
+                            }
+                except Exception:
+                    pass
+
+            log_llm_failure(
+                {
+                    "req": req_num,
+                    "ts": ts,
+                    "provider": label,
+                    "error": str(e),
+                    "tokens": token_info,
+                    "prompt_chars": prompt_chars,
+                }
+            )
             continue
 
-    # All providers failed
-    all_errors = " | ".join(errors)
-    logger.error(f"LLM #{req_num} — ALL PROVIDERS FAILED: {all_errors}")
-    return f"ERROR: All providers failed — {all_errors}"
+    # All failed — log final failure
+    log_llm_failure(
+        {
+            "req": req_num,
+            "ts": ts,
+            "provider": "ALL_FAILED",
+            "error": "Exhausted all providers",
+            "prompt_chars": prompt_chars,
+        }
+    )
+    return "ERROR: All providers failed"
 
 
 # ========== AI FIELD EXTRACTION ==========
 def extract_all_fields_with_ai(resume_text, jd_text):
-    logger.info(
-        f"AI extraction — resume: {len(resume_text)} chars, JD: {len(jd_text)} chars"
-    )
-
     prompt = f"""You are an expert resume parser. Extract the following information from this resume with 100% accuracy.
 
 CRITICAL INSTRUCTIONS:
@@ -224,10 +220,10 @@ CRITICAL INSTRUCTIONS:
 9. Count all distinct jobs/positions in the work history
 
 RESUME TEXT:
-{resume_text[:3000]}
+{resume_text[:5000]}
 
 JOB DESCRIPTION:
-{jd_text[:1000]}
+{jd_text[:2000]}
 
 Return JSON in this EXACT format:
 {{
@@ -250,17 +246,20 @@ Return JSON in this EXACT format:
     response = get_llm_response(prompt)
 
     if response.startswith("ERROR:"):
-        logger.error(f"AI extraction failed: {response}")
         return {}
 
     try:
         json_match = re.search(r"\{.*\}", response, re.DOTALL)
         if json_match:
-            data = json.loads(json_match.group(0))
-            logger.info(f"AI extraction success — {len(data)} fields parsed")
-            return data
+            return json.loads(json_match.group(0))
     except (json.JSONDecodeError, ValueError) as e:
-        logger.error(f"JSON parsing error: {e}")
+        log_llm_failure(
+            {
+                "ts": datetime.now().isoformat(),
+                "error": f"JSON parse: {e}",
+                "response_preview": response[:300],
+            }
+        )
         st.error(f"JSON parsing error: {e}")
 
     return {}
@@ -313,7 +312,6 @@ def extract_contact_backup(text):
 
     li_m = re.search(r"linkedin\.com/in/([A-Za-z0-9\-]+)", text, re.IGNORECASE)
     linkedin = f"linkedin.com/in/{li_m.group(1)}" if li_m else "N/A"
-
     return email, phone, linkedin
 
 
@@ -359,21 +357,21 @@ def _pick(ai_val, backup_val):
     return ai_val if ai_val and ai_val != "N/A" else backup_val
 
 
+def _dedup_key(row):
+    name = str(row.get("Name", "")).strip().lower()
+    email = str(row.get("Email", "")).strip().lower()
+    jd = str(row.get("Job Description", "")).strip().lower()
+    return (name, email, jd)
+
+
 # ========== RESUME PROCESSING ==========
 def process_resume(resume_file, jd_text, jd_name, batch_ts):
-    logger.info(f"Processing: {resume_file.name}")
-
     try:
         resume_text = extract_text(resume_file)
         if not resume_text or len(resume_text) < 50:
-            logger.warning(
-                f"{resume_file.name}: extraction failed ({len(resume_text or '')} chars)"
-            )
             return _error_record(
                 resume_file.name, "Text extraction failed", jd_name, batch_ts
             )
-
-        logger.info(f"{resume_file.name}: extracted {len(resume_text)} chars")
 
         ai = extract_all_fields_with_ai(resume_text, jd_text)
         b_name = extract_name_backup(resume_text)
@@ -384,15 +382,12 @@ def process_resume(resume_file, jd_text, jd_name, batch_ts):
         total_jobs = ai.get("total_jobs", _count_jobs(job_history))
         total_exp = _pick(ai.get("total_experience"), b_exp)
 
-        result = {
-            "Processed At": batch_ts,
-            "Job Description": jd_name,
+        return {
             "Name": _pick(ai.get("name"), b_name),
+            "Resume Match Score": ai.get("match_score", "N/A"),
             "Email": _pick(ai.get("email"), b_email),
             "Phone": _pick(ai.get("phone"), b_phone),
             "LinkedIn": _pick(ai.get("linkedin"), b_linkedin),
-            "Other Socials": ai.get("other_socials", "N/A"),
-            "Location": ai.get("location", "N/A"),
             "Current Job Title": ai.get("current_job_title", "N/A"),
             "Current Organization": ai.get("current_organization", "N/A"),
             "Total Experience": total_exp,
@@ -400,19 +395,22 @@ def process_resume(resume_file, jd_text, jd_name, batch_ts):
             if str(total_jobs).isdigit()
             else str(_count_jobs(job_history)),
             "Average Tenure": _avg_tenure(total_exp, total_jobs),
+            "Location": ai.get("location", "N/A"),
             "Role in JD": ai.get("role_in_jd", "N/A"),
-            "Resume Match Score": ai.get("match_score", "N/A"),
             "Resume Summary": ai.get("summary", "N/A"),
             "Job History (org-title-jobDuration)": job_history,
+            "Other Socials": ai.get("other_socials", "N/A"),
+            "Processed At": batch_ts,
+            "Job Description": jd_name,
         }
 
-        logger.info(
-            f"{resume_file.name}: done — Name={result['Name']}, Score={result['Resume Match Score']}"
-        )
-        return result
-
     except Exception as e:
-        logger.error(f"{resume_file.name}: error — {e}")
+        log_llm_failure(
+            {
+                "ts": datetime.now().isoformat(),
+                "error": f"process_resume: {resume_file.name}: {e}",
+            }
+        )
         return _error_record(
             resume_file.name, f"Processing error: {e}", jd_name, batch_ts
         )
@@ -422,33 +420,92 @@ def _error_record(filename, error_msg, jd_name, batch_ts):
     record = {col: "N/A" for col in EXCEL_COLUMNS}
     record.update(
         {
-            "Processed At": batch_ts,
-            "Job Description": jd_name,
             "Name": filename,
             "Resume Match Score": "Error",
             "Resume Summary": error_msg,
+            "Processed At": batch_ts,
+            "Job Description": jd_name,
         }
     )
     return record
 
 
-# ========== EXCEL APPEND ==========
+# ========== DUPLICATE DETECTION ==========
+def detect_duplicates(new_results):
+    conflicts = []
+    non_conflicts = []
+
+    if not RESULTS_EXCEL.exists():
+        return [], new_results
+
+    try:
+        existing_df = pd.read_excel(RESULTS_EXCEL, engine="openpyxl")
+    except Exception:
+        return [], new_results
+
+    if existing_df.empty:
+        return [], new_results
+
+    existing_lookup = {}
+    for idx, row in existing_df.iterrows():
+        key = _dedup_key(row.to_dict())
+        if key[0] == "n/a" and key[1] == "n/a":
+            continue
+        existing_lookup[key] = (row.to_dict(), idx)
+
+    for new_row in new_results:
+        key = _dedup_key(new_row)
+        if (key[0] == "n/a" and key[1] == "n/a") or key not in existing_lookup:
+            non_conflicts.append(new_row)
+        else:
+            old_row, old_idx = existing_lookup[key]
+            conflicts.append(
+                {
+                    "key": key,
+                    "old_row": old_row,
+                    "new_row": new_row,
+                    "old_excel_idx": old_idx,
+                }
+            )
+
+    return conflicts, non_conflicts
+
+
+# ========== EXCEL OPERATIONS ==========
 def append_results_to_excel(results: list):
+    if not results:
+        return
     new_df = pd.DataFrame(results).reindex(columns=EXCEL_COLUMNS)
 
     if RESULTS_EXCEL.exists():
         try:
             existing_df = pd.read_excel(RESULTS_EXCEL, engine="openpyxl")
             combined_df = pd.concat([existing_df, new_df], ignore_index=True)
-        except Exception as e:
-            logger.error(f"Excel read error: {e} — overwriting")
+        except Exception:
             combined_df = new_df
     else:
         combined_df = new_df
 
     combined_df.to_excel(RESULTS_EXCEL, index=False, engine="openpyxl")
-    logger.info(f"Excel updated: {len(combined_df)} total rows")
     return combined_df
+
+
+def replace_rows_in_excel(replacements: list):
+    if not replacements or not RESULTS_EXCEL.exists():
+        return
+
+    try:
+        df = pd.read_excel(RESULTS_EXCEL, engine="openpyxl")
+    except Exception:
+        return
+
+    for old_idx, new_row in replacements:
+        if old_idx < len(df):
+            for col in EXCEL_COLUMNS:
+                if col in new_row:
+                    df.at[old_idx, col] = new_row[col]
+
+    df.to_excel(RESULTS_EXCEL, index=False, engine="openpyxl")
 
 
 # ========== DISPLAY ==========
@@ -472,7 +529,6 @@ def display_results():
     c3.metric("👤 Names", names_ok)
     c4.metric("📈 Tenure", tenure_ok)
 
-    # Tenure insights
     tenure_values = []
     for r in results:
         if r["Average Tenure"] != "N/A":
@@ -517,6 +573,108 @@ def display_results():
         st.write(f"• **{label}**: {count}/{total} ({count / total * 100:.1f}%)")
 
 
+def display_conflict_resolution():
+    conflicts = st.session_state.pending_conflicts
+
+    st.warning(
+        f"⚠️ {len(conflicts)} duplicate(s) found — same candidate compared with the same JD before."
+    )
+
+    bulk_col1, bulk_col2, bulk_col3 = st.columns(3)
+    with bulk_col1:
+        if st.button("✅ Keep All Latest", type="primary"):
+            _resolve_all_conflicts("new")
+            return
+    with bulk_col2:
+        if st.button("⏪ Keep All Previous"):
+            _resolve_all_conflicts("old")
+            return
+    with bulk_col3:
+        if st.button("🔽 Choose Individually"):
+            pass
+
+    st.divider()
+
+    for i, conflict in enumerate(conflicts):
+        old = conflict["old_row"]
+        new = conflict["new_row"]
+        name = new.get("Name", "Unknown")
+        jd = new.get("Job Description", "Unknown")
+
+        st.subheader(f"Conflict {i + 1}: {name} vs {jd}")
+
+        compare_fields = [
+            "Resume Match Score",
+            "Current Job Title",
+            "Current Organization",
+            "Total Experience",
+            "Average Tenure",
+            "Location",
+            "Resume Summary",
+        ]
+
+        col_old, col_new = st.columns(2)
+        with col_old:
+            st.markdown(f"**Previous** (_{old.get('Processed At', '?')}_)")
+            for field in compare_fields:
+                st.write(f"**{field}:** {old.get(field, 'N/A')}")
+        with col_new:
+            st.markdown(f"**Latest** (_{new.get('Processed At', '?')}_)")
+            for field in compare_fields:
+                st.write(f"**{field}:** {new.get(field, 'N/A')}")
+
+        choice = st.radio(
+            f"Keep which for **{name}**?",
+            options=["Latest", "Previous"],
+            key=f"conflict_choice_{i}",
+            horizontal=True,
+        )
+        conflict["user_choice"] = "new" if choice == "Latest" else "old"
+        st.divider()
+
+    if st.button("💾 Apply Selections & Save", type="primary"):
+        _resolve_individual_conflicts()
+
+
+def _resolve_all_conflicts(keep):
+    conflicts = st.session_state.pending_conflicts
+    non_conflicts = st.session_state.non_conflict_results
+
+    if keep == "new":
+        replace_rows_in_excel([(c["old_excel_idx"], c["new_row"]) for c in conflicts])
+
+    if non_conflicts:
+        append_results_to_excel(non_conflicts)
+
+    _clear_conflict_state()
+    st.rerun()
+
+
+def _resolve_individual_conflicts():
+    conflicts = st.session_state.pending_conflicts
+    non_conflicts = st.session_state.non_conflict_results
+
+    replacements = [
+        (c["old_excel_idx"], c["new_row"])
+        for c in conflicts
+        if c.get("user_choice") == "new"
+    ]
+    if replacements:
+        replace_rows_in_excel(replacements)
+
+    if non_conflicts:
+        append_results_to_excel(non_conflicts)
+
+    _clear_conflict_state()
+    st.rerun()
+
+
+def _clear_conflict_state():
+    st.session_state.pending_conflicts = None
+    st.session_state.non_conflict_results = None
+    st.session_state.conflict_resolved = True
+
+
 # ========== MAIN UI ==========
 def main():
     st.set_page_config(page_title="🎯 Resume Screener", layout="wide")
@@ -525,24 +683,21 @@ def main():
     st.title("🎯 Resume Screener")
     st.markdown("**AI-powered resume parsing with automatic Excel logging**")
 
-    # Sidebar
     with st.sidebar:
         st.header("📊 Dashboard")
         st.metric("🤖 LLM Calls", st.session_state.llm_request_count)
 
-        # Show which providers are configured
         providers = ["Gemini"]
         if GROQ_KEY_PRIMARY:
-            providers.append("Groq")
+            providers.extend(["Groq/compound", "Groq/llama"])
         if GROQ_KEY_ALT:
-            providers.append("Groq-Alt")
-        st.caption(f"**Providers:** {' → '.join(providers)}")
+            providers.extend(["Groq-Alt/compound", "Groq-Alt/llama"])
+        st.caption(f"**Fallback:** {' → '.join(providers)}")
 
         st.divider()
         st.subheader("📂 Files")
         st.code(str(LOG_DIR), language=None)
-        st.caption("• `app_activity.log`")
-        st.caption("• `llm_calls.jsonl`")
+        st.caption("• `llm_calls.jsonl` — errors only")
         st.caption("• `resume_screening_results.xlsx`")
 
         if RESULTS_EXCEL.exists():
@@ -557,9 +712,15 @@ def main():
             st.session_state.results = None
             st.session_state.df = None
             st.session_state.processing_done = False
+            st.session_state.pending_conflicts = None
+            st.session_state.non_conflict_results = None
+            st.session_state.conflict_resolved = False
             st.rerun()
 
-    # Upload
+    if st.session_state.pending_conflicts:
+        display_conflict_resolution()
+        return
+
     col1, col2 = st.columns(2)
     with col1:
         jd_file = st.file_uploader("📋 Job Description", type=["pdf", "docx"])
@@ -568,7 +729,6 @@ def main():
             "📄 Resumes", type=["pdf", "docx"], accept_multiple_files=True
         )
 
-    # Process
     if st.button("🚀 Start Processing", type="primary"):
         if not jd_file or not resume_files:
             st.error("⚠️ Upload both a JD and at least one resume")
@@ -604,12 +764,15 @@ def main():
                 )
                 st.session_state.processing_done = True
 
-                append_results_to_excel(results)
+                conflicts, non_conflicts = detect_duplicates(results)
 
-                ok = sum(1 for r in results if r["Resume Match Score"] != "Error")
-                logger.info(
-                    f"RUN COMPLETE — {ok}/{len(results)} successful | LLM calls: {st.session_state.llm_request_count}"
-                )
+                if conflicts:
+                    st.session_state.pending_conflicts = conflicts
+                    st.session_state.non_conflict_results = non_conflicts
+                    st.session_state.conflict_resolved = False
+                    st.rerun()
+                else:
+                    append_results_to_excel(results)
 
     if st.session_state.processing_done and st.session_state.results:
         display_results()
