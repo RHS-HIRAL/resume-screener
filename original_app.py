@@ -47,7 +47,7 @@ def extract_text(uploaded_file):
 # ========== AI-POWERED EXTRACTION ==========
 def get_gemini_response(prompt):
     try:
-        model = genai.GenerativeModel("gemini-2.5-flash")
+        model = genai.GenerativeModel("gemini-2.5-pro")
         response = model.generate_content(prompt)
         return response.text
     except Exception as e:

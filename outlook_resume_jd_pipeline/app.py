@@ -1,4 +1,5 @@
 import os
+import shutil
 import sys
 import json
 import re
@@ -1073,6 +1074,14 @@ def run_pipeline():
         results["skipped_no_resume"],
     )
     logger.info("=" * 70)
+
+    # ── Clean up temp directory ──
+    try:
+        if os.path.isdir(config.TEMP_DIR):
+            shutil.rmtree(config.TEMP_DIR)
+            logger.info("Cleaned up temp directory: %s", config.TEMP_DIR)
+    except OSError as e:
+        logger.warning("Could not remove temp directory %s: %s", config.TEMP_DIR, e)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

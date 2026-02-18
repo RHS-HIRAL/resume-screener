@@ -130,7 +130,7 @@ def extract_text(uploaded_file):
 # ========== LLM PROVIDERS ==========
 def _call_gemini(prompt):
     """Call Google Gemini API"""
-    model = genai.GenerativeModel("gemini-2.5-flash")
+    model = genai.GenerativeModel("gemini-2.5-pro")
     response = model.generate_content(prompt)
     return response.text
 

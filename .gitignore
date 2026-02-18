@@ -5,3 +5,8 @@ resume_screener_logs
 __pycache__
 outlook_resume_jd_pipeline/logs
 jd_rag_pipeline/downloads
+extracted_results
+old_screening_results
+screening_results
+extracted_json_jd
+extracted_json_resumes

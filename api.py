@@ -97,7 +97,7 @@ def extract_text(filename: str, content: bytes) -> str:
 
 # ========== LLM PROVIDERS ==========
 def _call_gemini(prompt):
-    model = genai.GenerativeModel("gemini-2.5-flash")
+    model = genai.GenerativeModel("gemini-2.5-pro")
     return model.generate_content(prompt).text
 
 

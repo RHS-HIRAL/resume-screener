@@ -1,10 +1,12 @@
+import json
 import os
+import shutil
 import sys
 import re
 import logging
 import time
 from datetime import datetime
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from urllib.parse import quote, urljoin
 
 import msal
@@ -76,6 +78,9 @@ class config:
 
     # ─── Notifications ───────────────────────────────────────────────────────
     TEAMS_WEBHOOK_URL = os.getenv("TEAMS_WEBHOOK_URL", "")
+
+    # ─── JD JSON Export Directory ─────────────────────────────────────────
+    JD_JSON_DIR = os.getenv("JD_JSON_DIR", "../extracted_json_jd")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -732,9 +737,13 @@ def generate_job_pdf(jd: JobDescription, output_path: str) -> str:
 def _build_meta_pairs(jd: JobDescription) -> list[tuple[str, str]]:
     """Build ordered (label, value) pairs for the metadata grid."""
     pairs = []
+    # Combine Job Type and Employment Type into one field
+    combined_job_type = " / ".join(
+        filter(None, [jd.job_type, jd.employment_type])
+    )
     for label, val in [
         ("Location", jd.location),
-        ("Job Type", jd.job_type),
+        ("Job Type", combined_job_type),
         ("Department", jd.department),
         ("Experience", jd.experience),
         ("Shifts", jd.shifts),
@@ -742,7 +751,6 @@ def _build_meta_pairs(jd: JobDescription) -> list[tuple[str, str]]:
         ("Positions", jd.positions),
         ("Work Hours", jd.work_hours),
         ("Compensation", jd.compensation),
-        ("Employment Type", jd.employment_type),
         ("Job Category", jd.job_category),
     ]:
         if val:
@@ -769,6 +777,19 @@ def _safe(text: str) -> str:
 
 logger_sp = logging.getLogger("sharepoint_uploader")
 
+# Maps code-side keys to SharePoint custom column names.
+# These columns must be created in the SharePoint document library first.
+JD_FIELD_MAP = {
+    "JDTitle": "JDTitle",
+    "JDLocation": "JDLocation",
+    "JDJobType": "JDJobType",
+    "JDDepartment": "JDDepartment",
+    "JDExperience": "JDExperience",
+    "JDJobCategory": "JDJobCategory",
+    "JDScrapedDate": "JDScrapedDate",
+    "JDSourceURL": "JDSourceURL",
+}
+
 
 class SharePointUploader:
     """Uploads files to SharePoint and checks for existing files."""
@@ -789,8 +810,13 @@ class SharePointUploader:
             self._existing_files = self._list_existing_files()
         return filename.lower() in self._existing_files
 
-    def upload_jd(self, file_path: str, target_filename: str) -> dict:
-        """Upload a JD PDF to the JobDescriptions/ folder."""
+    def upload_jd(
+        self, file_path: str, target_filename: str, metadata: dict | None = None
+    ) -> dict:
+        """
+        Upload a JD PDF to the JobDescriptions/ folder and optionally
+        tag it with metadata columns.
+        """
         drive_id = self._get_drive_id()
         folder = config.SHAREPOINT_JD_FOLDER.strip("/")
         self._ensure_folder(drive_id, folder)
@@ -810,6 +836,11 @@ class SharePointUploader:
             target_filename,
             item.get("id"),
         )
+
+        # Tag the uploaded file with metadata
+        if metadata:
+            self._set_metadata(drive_id, item["id"], metadata)
+
         if self._existing_files is not None:
             self._existing_files.add(target_filename.lower())
         return item
@@ -983,6 +1014,29 @@ class SharePointUploader:
                 offset += len(chunk)
         return resp.json()
 
+    # ── Metadata ──────────────────────────────────────────────────────────────
+
+    def _set_metadata(self, drive_id: str, item_id: str, metadata: dict) -> None:
+        """Set custom column values on the uploaded file's SharePoint list item."""
+        url = f"{self.base}/drives/{drive_id}/items/{item_id}/listItem/fields"
+        fields = {
+            JD_FIELD_MAP[k]: v for k, v in metadata.items() if k in JD_FIELD_MAP and v
+        }
+        if not fields:
+            logger_sp.warning("No metadata to set for item %s", item_id)
+            return
+
+        resp = requests.patch(url, headers=self.headers, json=fields, timeout=30)
+        if resp.status_code == 200:
+            logger_sp.info("Metadata set on item %s: %s", item_id, list(fields.keys()))
+        else:
+            logger_sp.warning(
+                "Failed to set metadata on %s (HTTP %s): %s",
+                item_id,
+                resp.status_code,
+                resp.text,
+            )
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  NOTIFICATIONS
@@ -1065,19 +1119,173 @@ def send_jd_summary(results: dict) -> None:
 
 logger = logging.getLogger("jd_pipeline")
 
+# ── Section-heading keyword sets for structured extraction ─────────────────
+_SKILL_HEADINGS = {
+    "must have skills", "must-have skills", "required skills",
+    "technical skills", "key skills", "core competencies",
+    "skills required", "skills",
+}
+_TOOL_HEADINGS = {
+    "tools", "technologies", "tech stack", "platforms",
+    "software", "tools and technologies",
+}
+_EDUCATION_HEADINGS = {
+    "qualifications", "education", "academic qualifications",
+    "candidate requirements", "required qualifications",
+    "eligibility",
+}
+_RESPONSIBILITY_HEADINGS = {
+    "responsibilities", "key responsibilities", "job description",
+    "job summary", "role overview", "position summary",
+    "duties", "what you will do",
+}
+_GOOD_TO_HAVE_HEADINGS = {
+    "good to have", "good to have skills", "nice to have",
+    "preferred qualifications", "preferred skills",
+    "preferred certification", "certifications", "certification",
+}
+
+
+def extract_structured_jd_fields(jd_dict: dict) -> dict:
+    """
+    Extract scorer-compatible structured fields from the raw JD dict.
+
+    Reads sections (heading + bullets + paragraphs) and populates:
+      - required_skills   : list[str]
+      - good_to_have_skills : list[str]
+      - required_tools    : list[str]
+      - min_education     : str
+      - required_experience_years : int | float
+      - responsibilities_text : str
+      - location          : str  (already present, just copied)
+
+    Returns the original dict with these keys added/merged.
+    """
+    sections = jd_dict.get("sections", [])
+
+    required_skills: list[str] = []
+    good_to_have_skills: list[str] = []
+    required_tools: list[str] = []
+    education_bullets: list[str] = []
+    responsibilities_parts: list[str] = []
+
+    for sec in sections:
+        heading = sec.get("heading", "").strip()
+        heading_lower = heading.lower().rstrip(":")
+        bullets = sec.get("bullets", [])
+        paragraphs = sec.get("paragraphs", [])
+        all_items = bullets + paragraphs
+
+        # ── Skills ──
+        if heading_lower in _SKILL_HEADINGS or any(kw in heading_lower for kw in ("must have", "required skill", "technical skill", "key skill")):
+            required_skills.extend(
+                _clean_html(b) for b in bullets if b.strip()
+            )
+            for p in paragraphs:
+                cleaned = _clean_html(p)
+                # Skip sub-headings like "Scripting Languages:"
+                if cleaned and not cleaned.endswith(":"):
+                    required_skills.append(cleaned)
+            continue
+
+        # ── Tools (explicit tools section) ──
+        if heading_lower in _TOOL_HEADINGS or any(kw in heading_lower for kw in ("tools", "technologies", "tech stack")):
+            required_tools.extend(
+                _clean_html(b) for b in bullets if b.strip()
+            )
+            continue
+
+        # ── Good to have ──
+        if heading_lower in _GOOD_TO_HAVE_HEADINGS or any(kw in heading_lower for kw in ("good to have", "nice to have", "preferred")):
+            good_to_have_skills.extend(
+                _clean_html(b) for b in bullets if b.strip()
+            )
+            continue
+
+        # ── Education / Qualifications ──
+        if heading_lower in _EDUCATION_HEADINGS or any(kw in heading_lower for kw in ("qualif", "education", "eligib")):
+            education_bullets.extend(
+                _clean_html(b) for b in bullets if b.strip()
+            )
+            for p in paragraphs:
+                cleaned = _clean_html(p)
+                if cleaned:
+                    education_bullets.append(cleaned)
+            continue
+
+        # ── Responsibilities / Job Description ──
+        if heading_lower in _RESPONSIBILITY_HEADINGS or any(kw in heading_lower for kw in ("responsibilit", "job description", "job summary", "dut")):
+            for p in paragraphs:
+                cleaned = _clean_html(p)
+                if cleaned:
+                    responsibilities_parts.append(cleaned)
+            for b in bullets:
+                cleaned = _clean_html(b)
+                if cleaned:
+                    responsibilities_parts.append(cleaned)
+            continue
+
+        # ── Any other section → add bullets to responsibilities ──
+        for b in bullets:
+            cleaned = _clean_html(b)
+            if cleaned:
+                responsibilities_parts.append(cleaned)
+        for p in paragraphs:
+            cleaned = _clean_html(p)
+            if cleaned and not cleaned.endswith(":"):
+                responsibilities_parts.append(cleaned)
+
+    # ── Parse experience years from the "experience" text field ──
+    exp_text = jd_dict.get("experience", "") or ""
+    required_yoe = _parse_experience_years(exp_text)
+
+    # ── Build min_education string ──
+    min_education = "; ".join(education_bullets) if education_bullets else ""
+
+    # ── Merge into the dict ──
+    jd_dict["required_skills"] = required_skills
+    jd_dict["good_to_have_skills"] = good_to_have_skills
+    jd_dict["required_tools"] = required_tools
+    jd_dict["min_education"] = min_education
+    jd_dict["required_experience_years"] = required_yoe
+    jd_dict["responsibilities_text"] = " ".join(responsibilities_parts)
+
+    return jd_dict
+
+
+def _clean_html(text: str) -> str:
+    """Strip HTML tags from a string."""
+    if not text:
+        return ""
+    return BeautifulSoup(text, "html.parser").get_text(strip=True)
+
+
+def _parse_experience_years(text: str) -> int:
+    """
+    Extract numeric years from an experience string.
+    Examples: '6+ years' → 6, '0 – 2 Years' → 0, '3-5 years' → 3
+    """
+    if not text:
+        return 0
+    # Look for patterns like '6+', '3-5', '0 – 2'
+    m = re.search(r"(\d+)\s*[+\-–—]?", text)
+    if m:
+        return int(m.group(1))
+    return 0
+
 
 def setup_logging():
-    fmt = "%(asctime)s | %(levelname)-7s | %(name)-22s | %(message)s"
-    os.makedirs("logs", exist_ok=True)
+    os.makedirs(os.path.dirname(config.LOG_FILE) or ".", exist_ok=True)
     handlers = [
         logging.StreamHandler(sys.stdout),
         logging.FileHandler(config.LOG_FILE, encoding="utf-8"),
     ]
     logging.basicConfig(
-        level=getattr(logging, config.LOG_LEVEL),
-        format=fmt,
+        level=getattr(logging, config.LOG_LEVEL.upper(), logging.INFO),
+        format="%(asctime)s | %(levelname)-7s | %(name)-22s | %(message)s",
         handlers=handlers,
     )
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 
 def run_pipeline():
@@ -1161,6 +1369,28 @@ def run_pipeline():
             results["failed"] += 1
             continue
 
+        # ── Save JD as JSON locally ──
+        json_dir = config.JD_JSON_DIR
+        os.makedirs(json_dir, exist_ok=True)
+        json_filename = f"JD_{safe_slug}.json"
+        json_path = os.path.join(json_dir, json_filename)
+        try:
+            jd_dict = asdict(jd)
+            # Extract structured fields for scorer compatibility
+            jd_dict = extract_structured_jd_fields(jd_dict)
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(jd_dict, f, indent=2, ensure_ascii=False)
+            logger.info(
+                "  Saved JD JSON: %s (skills=%d, tools=%d, edu='%s', yoe=%s)",
+                json_path,
+                len(jd_dict.get("required_skills", [])),
+                len(jd_dict.get("required_tools", [])),
+                jd_dict.get("min_education", "")[:50],
+                jd_dict.get("required_experience_years", 0),
+            )
+        except Exception as e:
+            logger.warning("  Could not save JD JSON: %s", e)
+
         # ── Generate PDF ──
         local_path = os.path.join(config.TEMP_DIR, pdf_filename)
         try:
@@ -1172,7 +1402,26 @@ def run_pipeline():
 
         # ── Upload to SharePoint ──
         try:
-            uploader.upload_jd(file_path=local_path, target_filename=pdf_filename)
+            # Build metadata dict from parsed JD
+            # Combine Job Type + Employment Type into one field
+            combined_job_type = " / ".join(
+                filter(None, [jd.job_type, jd.employment_type])
+            )
+            jd_metadata = {
+                "JDTitle": jd.title,
+                "JDLocation": jd.location,
+                "JDJobType": combined_job_type,
+                "JDDepartment": jd.department,
+                "JDExperience": jd.experience,
+                "JDJobCategory": jd.job_category,
+                "JDScrapedDate": jd.scraped_date,
+                "JDSourceURL": jd.url,
+            }
+            uploader.upload_jd(
+                file_path=local_path,
+                target_filename=pdf_filename,
+                metadata=jd_metadata,
+            )
             results["uploaded"] += 1
             logger.info(
                 "  OK — uploaded to SharePoint:/%s/%s",
@@ -1201,6 +1450,14 @@ def run_pipeline():
         results["failed"],
     )
     logger.info("=" * 70)
+
+    # ── Clean up temp directory ──
+    try:
+        if os.path.isdir(config.TEMP_DIR):
+            shutil.rmtree(config.TEMP_DIR)
+            logger.info("Cleaned up temp directory: %s", config.TEMP_DIR)
+    except OSError as e:
+        logger.warning("Could not remove temp directory %s: %s", config.TEMP_DIR, e)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

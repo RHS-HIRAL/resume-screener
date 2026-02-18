@@ -10,6 +10,7 @@ import pandas as pd
 from datetime import datetime
 from pathlib import Path
 from groq import Groq
+from resume_screener_pipeline.old_pipeline import ResumeScreenerPipeline
 
 # ========== ENVIRONMENT & API SETUP ==========
 load_dotenv()
@@ -73,6 +74,7 @@ def init_session_state():
         "pending_conflicts": None,
         "non_conflict_results": None,
         "conflict_resolved": False,
+        "pipeline_stage1_results": None,
     }.items():
         if key not in st.session_state:
             st.session_state[key] = default
@@ -104,7 +106,7 @@ def extract_text(uploaded_file):
 
 # ========== LLM PROVIDERS ==========
 def _call_gemini(prompt):
-    model = genai.GenerativeModel("gemini-2.5-flash")
+    model = genai.GenerativeModel("gemini-2.5-pro")
     response = model.generate_content(prompt)
     return response.text
 
@@ -708,6 +710,30 @@ def main():
                 pass
 
         st.divider()
+        st.subheader("⚡ Pipeline Mode")
+        use_two_stage = st.toggle(
+            "Two-Stage Pipeline",
+            value=False,
+            help="Stage 1: Vector+BM25 filter → Stage 2: LLM score only top-K",
+        )
+        if use_two_stage:
+            top_k = st.slider("Top-K for Stage 2", min_value=5, max_value=50, value=20)
+            fusion_mode = st.radio(
+                "Fusion Mode",
+                ["Weighted Average", "RRF (Reciprocal Rank Fusion)"],
+                index=0,
+                help="Weighted: α-blended scores. RRF: rank-based, prevents score domination.",
+            )
+            fusion_mode_val = "rrf" if "RRF" in fusion_mode else "weighted"
+            alpha = st.slider("Vector weight (α)", min_value=0.0, max_value=1.0, value=0.7, step=0.1,
+                              help="α × vector + (1-α) × BM25 (only affects Weighted mode)",
+                              disabled=(fusion_mode_val == "rrf"))
+        else:
+            top_k = 20
+            alpha = 0.7
+            fusion_mode_val = "weighted"
+
+        st.divider()
         if st.button("🗑️ Clear Screen"):
             st.session_state.results = None
             st.session_state.df = None
@@ -715,6 +741,7 @@ def main():
             st.session_state.pending_conflicts = None
             st.session_state.non_conflict_results = None
             st.session_state.conflict_resolved = False
+            st.session_state.pipeline_stage1_results = None
             st.rerun()
 
     if st.session_state.pending_conflicts:
@@ -736,7 +763,90 @@ def main():
             jd_text = extract_text(jd_file)
             if not jd_text:
                 st.error("❌ Failed to extract JD text")
+            elif use_two_stage:
+                # ── Two-Stage Pipeline ────────────────────────────
+                jd_name = jd_file.name
+                batch_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                log_batch_separator(batch_ts, jd_name, len(resume_files))
+
+                with st.status("⚡ Two-Stage Pipeline...", expanded=True) as status:
+                    # Extract all resume texts
+                    st.write("📄 Extracting resume texts...")
+                    resume_docs = []
+                    for idx, rf in enumerate(resume_files, 1):
+                        text = extract_text(rf)
+                        if text and len(text) > 50:
+                            resume_docs.append(
+                                {"id": rf.name, "text": text, "metadata": {"filename": rf.name}}
+                            )
+
+                    st.write(f"🔍 Stage 1: Filtering {len(resume_docs)} resumes (top {top_k})...")
+                    pipeline = ResumeScreenerPipeline(alpha=alpha, fusion_mode=fusion_mode_val)
+                    pipeline_results = pipeline.run_with_files(
+                        resume_docs=resume_docs,
+                        jd_text=jd_text,
+                        top_k=min(top_k, len(resume_docs)),
+                    )
+                    st.session_state.llm_request_count += pipeline.llm.request_count
+
+                    status.update(label="✅ Pipeline complete!", state="complete", expanded=False)
+
+                # Convert pipeline results to standard format
+                results = []
+                for pr in pipeline_results:
+                    results.append({
+                        "Name": pr.get("name", "N/A"),
+                        "Resume Match Score": f"{pr.get('match_score', 'N/A')}%"
+                            if isinstance(pr.get('match_score'), (int, float)) else "N/A",
+                        "Email": pr.get("email", "N/A"),
+                        "Phone": pr.get("phone", "N/A"),
+                        "LinkedIn": pr.get("linkedin", "N/A"),
+                        "Current Job Title": pr.get("current_job_title", "N/A"),
+                        "Current Organization": pr.get("current_organization", "N/A"),
+                        "Total Experience": pr.get("total_experience", "N/A"),
+                        "Total Jobs": "N/A",
+                        "Average Tenure": "N/A",
+                        "Location": pr.get("location", "N/A"),
+                        "Role in JD": jd_name,
+                        "Resume Summary": pr.get("summary", "N/A"),
+                        "Job History (org-title-jobDuration)": "N/A",
+                        "Other Socials": "N/A",
+                        "Processed At": batch_ts,
+                        "Job Description": jd_name,
+                    })
+
+                # Show Stage 1 scores in a separate table
+                st.subheader("⚡ Stage 1: Vector + BM25 Scores")
+                stage1_df = pd.DataFrame(pipeline_results)[
+                    ["filename", "name", "hybrid_score", "vector_score", "bm25_score", "match_score", "fit_report"]
+                ].rename(columns={
+                    "filename": "File", "name": "Name", "hybrid_score": "Hybrid Score",
+                    "vector_score": "Vector Score", "bm25_score": "BM25 Score",
+                    "match_score": "LLM Score", "fit_report": "Fit Report",
+                })
+                st.dataframe(stage1_df, use_container_width=True)
+
+                st.info(
+                    f"📊 Scanned **{len(resume_docs)}** resumes → "
+                    f"shortlisted **{len(pipeline_results)}** → "
+                    f"**{pipeline.llm.request_count}** LLM calls "
+                    f"(saved {len(resume_docs) - len(pipeline_results)} API calls)"
+                )
+
+                st.session_state.results = results
+                st.session_state.df = pd.DataFrame(results).reindex(columns=EXCEL_COLUMNS)
+                st.session_state.processing_done = True
+
+                conflicts, non_conflicts = detect_duplicates(results)
+                if conflicts:
+                    st.session_state.pending_conflicts = conflicts
+                    st.session_state.non_conflict_results = non_conflicts
+                    st.session_state.conflict_resolved = False
+                    st.rerun()
+                else:
+                    append_results_to_excel(results)
             else:
+                # ── Original single-resume processing ─────────────
                 jd_name = jd_file.name
                 batch_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 log_batch_separator(batch_ts, jd_name, len(resume_files))
