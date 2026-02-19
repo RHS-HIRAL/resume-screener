@@ -140,10 +140,6 @@ class JobDescription:
     shifts: str = ""
     experience: str = ""
     job_category: str = ""
-    positions: str = ""
-    designation: str = ""
-    work_hours: str = ""
-    compensation: str = ""
     employment_type: str = ""
 
     # ── Content sections (preserved in order) ──
@@ -272,11 +268,6 @@ META_LABEL_MAP = {
     "shift": "shifts",
     "experience": "experience",
     "job category": "job_category",
-    "position": "positions",
-    "designation": "designation",
-    "compensation": "compensation",
-    "work hrs": "work_hours",
-    "work hours": "work_hours",
     "employment type": "employment_type",
     "job title": "_skip",  # already captured from <h1>
     "internship title": "_skip",
@@ -747,10 +738,6 @@ def _build_meta_pairs(jd: JobDescription) -> list[tuple[str, str]]:
         ("Department", jd.department),
         ("Experience", jd.experience),
         ("Shifts", jd.shifts),
-        ("Designation", jd.designation),
-        ("Positions", jd.positions),
-        ("Work Hours", jd.work_hours),
-        ("Compensation", jd.compensation),
         ("Job Category", jd.job_category),
     ]:
         if val:

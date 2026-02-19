@@ -137,7 +137,7 @@ SAVE_CANDIDATE_TOOL = {
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TEXT EXTRACTION  (mirrors experiment_app.py)
+# TEXT EXTRACTION
 # ═══════════════════════════════════════════════════════════════════════════════
 def extract_text_from_pdf(file_path: str) -> str:
     """Extract text from a PDF file."""
