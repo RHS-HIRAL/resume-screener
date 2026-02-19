@@ -1,0 +1,100 @@
+{
+  "function_1_resume_jd_matching": {
+    "certifications": {
+      "status": "Partial Match",
+      "summary": "Candidate has Aruba certifications and completed a CCNA course, but lacks the preferred CCNP, JNCIP, or ITIL certifications."
+    },
+    "education": {
+      "status": "No Match",
+      "summary": "Candidate holds a B.E. in Civil Engineering, which does not align with the required Bachelor's degree in Computer Science, IT, or a related field."
+    },
+    "experience": {
+      "status": "No Match",
+      "summary": "Candidate has 2+ years of experience, significantly less than the required 5+ years for an L3 Network Engineer role."
+    },
+    "location": {
+      "status": "Match",
+      "summary": "Candidate is located in Bengaluru, which is one of the preferred job locations."
+    },
+    "overall_match_score": 25,
+    "project_history_relevance": {
+      "status": "Partial Match",
+      "summary": "Candidate has relevant project experience in general network design, deployment, and troubleshooting, but lacks specific projects involving the advanced data center, firewall, and load balancing technologies emphasized in the JD."
+    },
+    "skillset": {
+      "status": "No Match",
+      "summary": "Candidate's skillset is strong in Aruba wireless and general enterprise networking, but lacks deep expertise in advanced routing protocols (BGP, OSPF, MPLS), specific firewall platforms, load balancers, and core data center technologies required by the JD."
+    },
+    "tools_used": {
+      "status": "No Match",
+      "summary": "Candidate's experience with tools like Aruba Central, Juniper Mist, and Ekahau does not align with the specific tools (e.g., Wireshark, SolarWinds, Palo Alto, Cisco Nexus) required by the JD."
+    }
+  },
+  "function_2_resume_data_extraction": {
+    "career_metrics": {
+      "total_experience_in_years": 2.5,
+      "total_jobs": 1
+    },
+    "current_employment": {
+      "current_job_title": "Network Engineer II",
+      "current_organization": "Airowire Networks Pvt. Ltd."
+    },
+    "education_history": [
+      {
+        "degree": "Bachelor of Engineering (B.E)",
+        "graduation_year": "Sept 2022",
+        "institution": "Vidya Vikas Institute of Engineering & Technology, Mysore, Karnataka"
+      },
+      {
+        "degree": "Pre-University (PU)",
+        "graduation_year": "April 2018",
+        "institution": "Ananth PU College, Arsikere, Hassan, Karnataka"
+      }
+    ],
+    "personal_information": {
+      "email": "faizsahil8@gmail.com",
+      "full_name": "FAISAL M N",
+      "location": "Bengaluru, Karnataka",
+      "phone": "7204759397"
+    },
+    "professional_summary": "Dedicated Network Engineer with 2+ years of experience in deploying and managing enterprise wired and wireless networks. Skilled in Aruba, Juniper and Cisco devices, with a focus on Aruba solutions. Expertise in Ekahau tools for Wi-Fi heatmap design and wireless surveys. Proficient in end-to-end network implementation, troubleshooting, and performance optimization.",
+    "skills_inventory": [
+      "Aruba",
+      "Juniper",
+      "Cisco",
+      "Ekahau",
+      "Wi-Fi heatmap design",
+      "Wireless surveys",
+      "Network implementation",
+      "Troubleshooting",
+      "Performance optimization",
+      "Aruba Central Cloud Platform",
+      "Juniper Mist",
+      "Aruba Switches",
+      "Aruba Controllers",
+      "Aruba Access Points",
+      "RF analysis",
+      "Site surveys",
+      "Microsoft Visio",
+      "VLAN configuration",
+      "Stacking (VSX/VSF)",
+      "ACL",
+      "VRRP",
+      "IAP",
+      "Wireless optimization",
+      "Aruba Central AOS 10",
+      "Cisco Meraki",
+      "Forti-Manager",
+      "Hamina",
+      "Putty",
+      "Teraterm",
+      "HLD",
+      "LLD"
+    ],
+    "social_profiles": {
+      "github": "",
+      "linkedin": "LinkedIn",
+      "portfolio": ""
+    }
+  }
+}

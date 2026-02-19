@@ -1,6 +1,5 @@
 import os
 from dotenv import load_dotenv
-import json
 from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel, Field
 import google.generativeai as genai
@@ -10,33 +9,19 @@ load_dotenv()
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 model = genai.GenerativeModel('gemini-2.5-flash')
 
-class MatchParameter(BaseModel):
-    jd_requirement: str = Field(description="The requirement stated in the JD")
-    resume_value: str = Field(description="The corresponding value found in the resume")
+class ParameterMatch(BaseModel):
     status: str = Field(description="Match, Partial Match, or No Match")
-    score_contribution: int = Field(description="Points contributed to the overall score")
-
-class SkillMatch(BaseModel):
-    matched_skills: list[str]
-    missing_skills: list[str]
-    status: str
-    score_contribution: int
-
-class ToolMatch(BaseModel):
-    matched_tools: list[str]
-    missing_tools: list[str]
-    status: str
-    score_contribution: int
+    summary: str = Field(description="A 1-line summary indicating if and why it matches the JD")
 
 class ResumeJDMatch(BaseModel):
-    overall_match_score: int
-    experience: MatchParameter
-    education: MatchParameter
-    skillset: SkillMatch
-    location: MatchParameter
-    project_history_relevance: MatchParameter
-    tools_used: ToolMatch
-    certifications: MatchParameter
+    overall_match_score: int = Field(description="Overall match score strictly on a scale of 0 to 100")
+    experience: ParameterMatch
+    education: ParameterMatch
+    skillset: ParameterMatch
+    location: ParameterMatch
+    project_history_relevance: ParameterMatch
+    tools_used: ParameterMatch
+    certifications: ParameterMatch
 
 class PersonalInfo(BaseModel):
     full_name: str
@@ -87,7 +72,7 @@ async def analyze_resume(request: AnalysisRequest):
     
     Perform two functions and return the result strictly in the requested JSON schema:
     1. Extract structured data from the resume.
-    2. Evaluate the resume against the JD across key parameters to generate a match score.
+    2. Evaluate the resume against the JD across key parameters to generate an overall match score (0-100) and provide a concise 1-line summary for each parameter's match status.
     
     Resume Text:
     {request.resume_text}
