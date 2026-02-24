@@ -1,3 +1,4 @@
+# Run the server using: uvicorn server_app:app --reload
 import os
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Response
@@ -101,5 +102,3 @@ async def analyze_resume(request: AnalysisRequest):
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-# Run the server using: uvicorn server_app:app --reload
