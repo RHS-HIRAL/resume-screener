@@ -13,3 +13,9 @@ sentence-transformers>=3.0.0
 langchain-huggingface>=0.1.0
 msal>=1.28.0
 requests>=2.31.0
+fastapi
+uvicorn
+flask
+flask-login
+flask-cors
+openai-whisper

@@ -38,7 +38,7 @@ class config:
 
     # ─── Email Filtering ─────────────────────────────────────────────────────
     SUBJECT_KEYWORDS = ["new application received"]
-    LOOKBACK_HOURS = 24
+    LOOKBACK_HOURS = 100  # Last 4 days
 
     # ─── SharePoint Target ───────────────────────────────────────────────────
     SHAREPOINT_SITE_DOMAIN = os.getenv(

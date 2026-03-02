@@ -1,0 +1,521 @@
+{% extends "base.html" %}
+
+{% block title %}Screen Resume | Resume Screener{% endblock %}
+
+{% block content %}
+<div class="page-header" style="display: flex; justify-content: space-between; align-items: flex-end;">
+    <div>
+        <h1 class="page-title">Screen New Resume</h1>
+        <p class="page-subtitle">Select a candidate's resume and job description directly from SharePoint.</p>
+    </div>
+    <button id="refreshSp" class="btn" style="background: rgba(255,255,255,0.05); color: var(--text-secondary);">
+        <i class="fa-solid fa-arrows-rotate"></i> Refresh SharePoint
+    </button>
+</div>
+
+<div class="dashboard-grid" style="grid-template-columns: 1fr 1fr;">
+    <!-- SharePoint Browser Section -->
+    <div class="card">
+        <h2 style="font-size: 1.25rem; margin-bottom: 1.5rem; display: flex; align-items: center; gap: 0.5rem;">
+            <i class="fa-solid fa-folder-open" style="color: var(--accent-indigo);"></i> SharePoint Browser
+        </h2>
+
+        <form id="analysisForm">
+            <!-- Hidden Fields for AI Analysis -->
+            <input type="hidden" id="resume_text" name="resume_text">
+            <input type="hidden" id="resume_filename" name="resume_filename">
+            <input type="hidden" id="jd_text" name="jd_text">
+            <input type="hidden" id="jd_title" name="jd_title">
+
+            <div style="display: grid; grid-template-columns: 1fr; gap: 1.5rem;">
+                <!-- Resume Side -->
+                <div
+                    style="padding: 1.2rem; background: rgba(255,255,255,0.02); border-radius: 12px; border: 1px solid var(--border-color);">
+                    <div
+                        style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 1rem; color: var(--accent-indigo); font-weight: 600;">
+                        <i class="fa-solid fa-file-invoice"></i> Resume
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">Job Role / Subfolder</label>
+                        <select id="sp_role_select" class="form-control" required>
+                            <option value="">— Select job role —</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">Resume File</label>
+                        <select id="sp_resume_select" class="form-control" disabled required>
+                            <option value="">— Select resume —</option>
+                        </select>
+                    </div>
+
+                    <div id="resumePreviewStatus"
+                        style="font-size: 0.8rem; color: var(--accent-emerald); display: none;">
+                        <i class="fa-solid fa-check"></i> Resume loaded successfully
+                    </div>
+                </div>
+
+                <!-- JD Side -->
+                <div
+                    style="padding: 1.2rem; background: rgba(255,255,255,0.02); border-radius: 12px; border: 1px solid var(--border-color);">
+                    <div
+                        style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 1rem; color: var(--accent-amber); font-weight: 600;">
+                        <i class="fa-solid fa-clipboard-list"></i> Job Description
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">JD File</label>
+                        <select id="sp_jd_select" class="form-control" required>
+                            <option value="">— Select JD —</option>
+                        </select>
+                    </div>
+
+                    <div id="jdPreviewStatus" style="font-size: 0.8rem; color: var(--accent-emerald); display: none;">
+                        <i class="fa-solid fa-check"></i> JD loaded successfully
+                    </div>
+                </div>
+            </div>
+
+            <div class="form-group" style="display: flex; align-items: center; gap: 0.75rem; margin-top: 2rem;">
+                <label class="switch" style="position: relative; display: inline-block; width: 44px; height: 22px;">
+                    <input type="checkbox" id="sync_sharepoint" name="sync_sharepoint"
+                        style="opacity: 0; width: 0; height: 0;" checked>
+                    <span class="slider"
+                        style="position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #333; transition: .4s; border-radius: 34px;"></span>
+                </label>
+                <span style="font-size: 0.9rem; font-weight: 500;">Auto-sync with SharePoint MatchScore</span>
+            </div>
+
+            <button type="submit" id="analyzeBtn" class="btn btn-primary" style="width: 100%; margin-top: 1rem;"
+                disabled>
+                <i class="fa-solid fa-wand-magic-sparkles"></i> Start AI Analysis
+            </button>
+        </form>
+
+        <div id="progressContainer" style="display: none; margin-top: 2rem;">
+            <div style="display: flex; justify-content: space-between; margin-bottom: 0.5rem; font-size: 0.85rem;">
+                <span id="progressStatus">Initializing AI...</span>
+                <span id="progressPercent">0%</span>
+            </div>
+            <div
+                style="width: 100%; height: 8px; background: rgba(255,255,255,0.05); border-radius: 4px; overflow: hidden;">
+                <div id="progressBar"
+                    style="width: 0%; height: 100%; background: linear-gradient(90deg, var(--accent-indigo), var(--accent-emerald)); transition: width 0.3s;">
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Results/Preview Side -->
+    <div id="sideContainer" class="card" style="min-height: 400px; display: flex; flex-direction: column;">
+        <div id="emptyView"
+            style="flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; color: var(--text-secondary); padding: 2rem; text-align: center;">
+            <i class="fa-solid fa-magnifying-glass" style="font-size: 3rem; margin-bottom: 1.5rem; opacity: 0.2;"></i>
+            <h3>File Preview & Results</h3>
+            <p style="max-width: 300px; margin: 1rem auto;">Select files from SharePoint to see a preview here before
+                analysis.</p>
+        </div>
+
+        <div id="previewView" style="display: none; height: 100%;">
+            <div style="padding: 1rem; border-bottom: 1px solid var(--border-color); display: flex; gap: 1rem;">
+                <button id="showResumeBtn" class="btn"
+                    style="padding: 0.4rem 1rem; font-size: 0.8rem; background: var(--card-bg);">Resume Preview</button>
+                <button id="showJdBtn" class="btn"
+                    style="padding: 0.4rem 1rem; font-size: 0.8rem; background: transparent;">JD Preview</button>
+            </div>
+            <div id="previewContent"
+                style="padding: 1.5rem; font-size: 0.85rem; line-height: 1.6; white-space: pre-wrap; max-height: 500px; overflow-y: auto; color: var(--text-secondary);">
+            </div>
+        </div>
+
+        <div id="actualResults" style="display: none; width: 100%;">
+            <!-- Populated by JS -->
+        </div>
+    </div>
+</div>
+
+<style>
+    /* Slider styling for toggle */
+    input:checked+.slider {
+        background-color: var(--accent-indigo);
+    }
+
+    .slider:before {
+        position: absolute;
+        content: "";
+        height: 16px;
+        width: 16px;
+        left: 3px;
+        bottom: 3px;
+        background-color: white;
+        transition: .4s;
+        border-radius: 50%;
+    }
+
+    input:checked+.slider:before {
+        transform: translateX(22px);
+    }
+
+    .form-control:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+    }
+</style>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    let spData = { resumes: {}, jds: [] };
+    let activeResumeContent = "";
+    let activeJdContent = "";
+
+    async function initPage() {
+        await fetchFiles();
+        setupListeners();
+    }
+
+    async function fetchFiles() {
+        const btn = document.getElementById('refreshSp');
+        btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Loading...';
+
+        try {
+            const resp = await fetch('/api/sp/files');
+            const data = await resp.json();
+
+            if (data.connected) {
+                spData = data;
+                populateDropdowns();
+            } else {
+                alert("SharePoint error: " + data.error);
+            }
+        } catch (err) {
+            console.error("Failed to fetch SP files", err);
+        } finally {
+            btn.innerHTML = '<i class="fa-solid fa-arrows-rotate"></i> Refresh SharePoint';
+        }
+    }
+
+    function populateDropdowns() {
+        const roleSelect = document.getElementById('sp_role_select');
+        const jdSelect = document.getElementById('sp_jd_select');
+
+        roleSelect.innerHTML = '<option value="">— Select job role —</option>';
+        Object.keys(spData.resumes).sort().forEach(role => {
+            const opt = document.createElement('option');
+            opt.value = role;
+            opt.innerText = role;
+            roleSelect.appendChild(opt);
+        });
+
+        jdSelect.innerHTML = '<option value="">— Select JD —</option>';
+        spData.jds.forEach(jd => {
+            const opt = document.createElement('option');
+            opt.value = jd.id;
+            opt.innerText = jd.name;
+            opt.dataset.name = jd.name;
+            jdSelect.appendChild(opt);
+        });
+    }
+
+    function extractJobId(roleName) {
+        const match = roleName.match(/^(\d+)_/);
+        return match ? match[1] : null;
+    }
+
+    function setupListeners() {
+        const roleSelect = document.getElementById('sp_role_select');
+        const resumeSelect = document.getElementById('sp_resume_select');
+        const jdSelect = document.getElementById('sp_jd_select');
+        const analyzeBtn = document.getElementById('analyzeBtn');
+
+        roleSelect.onchange = () => {
+            const role = roleSelect.value;
+            document.getElementById('jd_title').value = role;
+
+            if (role) {
+                resumeSelect.disabled = false;
+                resumeSelect.innerHTML = '<option value="">— Select resume —</option>';
+                spData.resumes[role].forEach(f => {
+                    const opt = document.createElement('option');
+                    opt.value = f.id;
+                    opt.innerText = f.name;
+                    resumeSelect.appendChild(opt);
+                });
+
+                // Auto-select JD
+                const jobId = extractJobId(role);
+                if (jobId) {
+                    const matchingJd = spData.jds.find(j => j.name.startsWith(jobId));
+                    if (matchingJd) {
+                        jdSelect.value = matchingJd.id;
+                        jdSelect.onchange();
+                    }
+                }
+            } else {
+                resumeSelect.disabled = true;
+                resumeSelect.innerHTML = '<option value="">— Select resume —</option>';
+            }
+            checkReady();
+        };
+
+        resumeSelect.onchange = async () => {
+            const id = resumeSelect.value;
+            if (id) {
+                const fileName = resumeSelect.options[resumeSelect.selectedIndex].text;
+                document.getElementById('resume_filename').value = fileName;
+                await downloadContent(id, 'resume');
+            } else {
+                activeResumeContent = "";
+                document.getElementById('resumePreviewStatus').style.display = 'none';
+            }
+            checkReady();
+        };
+
+        jdSelect.onchange = async () => {
+            const id = jdSelect.value;
+            if (id) {
+                await downloadContent(id, 'jd');
+            } else {
+                activeJdContent = "";
+                document.getElementById('jdPreviewStatus').style.display = 'none';
+            }
+            checkReady();
+        };
+
+        document.getElementById('refreshSp').onclick = fetchFiles;
+    }
+
+    async function downloadContent(id, type) {
+        const previewView = document.getElementById('previewView');
+        const emptyView = document.getElementById('emptyView');
+        const previewContent = document.getElementById('previewContent');
+        const actualResults = document.getElementById('actualResults');
+        const analyzeBtn = document.getElementById('analyzeBtn');
+
+        previewView.style.display = 'block';
+        emptyView.style.display = 'none';
+        actualResults.style.display = 'none';
+
+        previewContent.innerHTML = `
+            <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; padding: 3rem; text-align:center;">
+                <i class="fa-solid fa-spinner fa-spin" style="font-size: 2.5rem; margin-bottom: 1.5rem; color: var(--accent-indigo);"></i>
+                <h4 style="color: var(--text-primary); margin-bottom: 0.5rem;">Fetching from SharePoint</h4>
+                <p style="color: var(--text-secondary); font-size: 0.9rem;">Reading ${type} content, please wait...</p>
+            </div>
+        `;
+
+        // Disable analysis while loading
+        analyzeBtn.disabled = true;
+
+        try {
+            const resp = await fetch(`/api/sp/content?item_id=${id}`);
+            const data = await resp.json();
+
+            if (!resp.ok) {
+                throw new Error(data.error || `Server error: ${resp.status}`);
+            }
+
+            if (type === 'resume') {
+                activeResumeContent = data.content;
+                document.getElementById('resume_text').value = data.content;
+                const status = document.getElementById('resumePreviewStatus');
+                status.style.display = 'block';
+                status.innerHTML = '<i class="fa-solid fa-check"></i> Resume loaded successfully';
+                status.style.color = 'var(--accent-emerald)';
+                showPreview('resume');
+            } else {
+                activeJdContent = data.content;
+                document.getElementById('jd_text').value = data.content;
+                const status = document.getElementById('jdPreviewStatus');
+                status.style.display = 'block';
+                status.innerHTML = '<i class="fa-solid fa-check"></i> JD loaded successfully';
+                status.style.color = 'var(--accent-emerald)';
+                showPreview('jd');
+            }
+        } catch (err) {
+            console.error("Download failed:", err);
+            previewContent.innerHTML = `
+                <div style="padding: 3rem; text-align:center; color: var(--accent-rose);">
+                    <i class="fa-solid fa-circle-exclamation" style="font-size: 3rem; margin-bottom: 1.5rem;"></i>
+                    <h3 style="margin-bottom: 1rem;">Download Failed</h3>
+                    <p style="background: rgba(255,0,0,0.05); padding: 1rem; border-radius: 8px; font-family: monospace; font-size: 0.85rem;">${err.message}</p>
+                    <button onclick="location.reload()" class="btn" style="margin-top: 1.5rem; background: var(--card-bg);">Retry Page</button>
+                </div>
+            `;
+
+            // Mark as failed in status badges
+            if (type === 'resume') {
+                activeResumeContent = "";
+                const status = document.getElementById('resumePreviewStatus');
+                status.style.display = 'block';
+                status.innerHTML = '<i class="fa-solid fa-xmark"></i> Failed to load resume';
+                status.style.color = 'var(--accent-rose)';
+            } else {
+                activeJdContent = "";
+                const status = document.getElementById('jdPreviewStatus');
+                status.style.display = 'block';
+                status.innerHTML = '<i class="fa-solid fa-xmark"></i> Failed to load JD';
+                status.style.color = 'var(--accent-rose)';
+            }
+        } finally {
+            checkReady();
+        }
+    }
+
+    function showPreview(type) {
+        const previewContent = document.getElementById('previewContent');
+        const resBtn = document.getElementById('showResumeBtn');
+        const jdBtn = document.getElementById('showJdBtn');
+
+        if (type === 'resume') {
+            previewContent.innerText = activeResumeContent || "No resume content loaded.";
+            resBtn.style.background = 'var(--card-bg)';
+            jdBtn.style.background = 'transparent';
+        } else {
+            previewContent.innerText = activeJdContent || "No JD content loaded.";
+            jdBtn.style.background = 'var(--card-bg)';
+            resBtn.style.background = 'transparent';
+        }
+    }
+
+    document.getElementById('showResumeBtn').onclick = () => showPreview('resume');
+    document.getElementById('showJdBtn').onclick = () => showPreview('jd');
+
+    function checkReady() {
+        const analyzeBtn = document.getElementById('analyzeBtn');
+        analyzeBtn.disabled = !(activeResumeContent && activeJdContent);
+    }
+
+    // ── Analysis Logic ──
+    document.getElementById('analysisForm').addEventListener('submit', async (e) => {
+        e.preventDefault();
+
+        const form = e.target;
+        const btn = document.getElementById('analyzeBtn');
+        const progCont = document.getElementById('progressContainer');
+        const progBar = document.getElementById('progressBar');
+        const progStatus = document.getElementById('progressStatus');
+        const progPercent = document.getElementById('progressPercent');
+        const previewView = document.getElementById('previewView');
+        const actualResults = document.getElementById('actualResults');
+
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Analyzing...';
+        progCont.style.display = 'block';
+
+        const formData = new FormData(form);
+
+        const eventSource = new EventSource('/api/progress');
+        eventSource.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            progBar.style.width = data.percent + '%';
+            progPercent.innerText = data.percent + '%';
+            progStatus.innerText = data.message;
+            if (data.percent >= 100) eventSource.close();
+        };
+
+        try {
+            const response = await fetch('/api/analyze', {
+                method: 'POST',
+                body: formData
+            });
+
+            if (!response.ok) throw new Error('Analysis failed');
+            const result = await response.json();
+
+            previewView.style.display = 'none';
+            actualResults.style.display = 'block';
+            renderResults(result);
+
+        } catch (err) {
+            alert('Error: ' + err.message);
+            btn.disabled = false;
+            btn.innerHTML = '<i class="fa-solid fa-wand-magic-sparkles"></i> Start AI Analysis';
+        }
+    });
+
+    function badgeHtml(status) {
+        const s = (status || 'Unknown').toLowerCase();
+        let bg, icon;
+        if (s === 'match') { bg = 'rgba(52,211,153,0.15)'; icon = '✅'; }
+        else if (s === 'partial match') { bg = 'rgba(251,191,36,0.15)'; icon = '⚠️'; }
+        else if (s === 'no match') { bg = 'rgba(244,63,94,0.15)'; icon = '❌'; }
+        else { bg = 'rgba(255,255,255,0.05)'; icon = '❔'; }
+        return `<span style="display:inline-block; padding:3px 10px; border-radius:20px; font-size:0.75rem; font-weight:600; background:${bg};">${icon} ${status}</span>`;
+    }
+
+    function renderResults(data) {
+        const actualResults = document.getElementById('actualResults');
+        const match = data.function_1_resume_jd_matching;
+        const extract = data.function_2_resume_data_extraction;
+        const score = match.overall_match_score;
+
+        const scoreColor = score >= 75 ? '#34d399' : (score >= 50 ? '#fbbf24' : '#f43f5e');
+        const scoreGlow = score >= 75 ? 'rgba(52,211,153,0.3)' : (score >= 50 ? 'rgba(251,191,36,0.3)' : 'rgba(244,63,94,0.3)');
+
+        const paramKeys = [
+            { key: 'experience', label: '⏱ Experience', },
+            { key: 'education', label: '🎓 Education', },
+            { key: 'location', label: '📍 Location', },
+            { key: 'project_history_relevance', label: '🏗 Project History', },
+            { key: 'tools_used', label: '🔧 Tools Used', },
+            { key: 'certifications', label: '🏅 Certifications', },
+        ];
+
+        let paramCards = paramKeys.map(p => {
+            const param = match[p.key] || {};
+            const status = param.status || 'Unknown';
+            const summary = param.summary || 'No details available.';
+            return `
+                <div style="padding:1.2rem; background:rgba(255,255,255,0.025); border-radius:12px; border:1px solid var(--border-color);">
+                    <div style="font-size:0.85rem; font-weight:600; margin-bottom:0.6rem; color:var(--text-primary);">${p.label}</div>
+                    <div style="margin-bottom:0.5rem;">${badgeHtml(status)}</div>
+                    <div style="font-size:0.8rem; color:var(--text-secondary); line-height:1.5;">${summary}</div>
+                </div>
+            `;
+        }).join('');
+
+        actualResults.innerHTML = `
+        <div style="padding: 1.5rem;">
+            <!-- Candidate Header -->
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem; padding-bottom: 1.5rem; border-bottom: 1px solid var(--border-color);">
+                <div>
+                    <h2 style="font-size: 1.4rem; margin-bottom: 0.25rem;">${extract.personal_information.full_name}</h2>
+                    <p style="color: var(--text-secondary); font-size: 0.85rem;">${extract.current_employment.current_job_title} @ ${extract.current_employment.current_organization}</p>
+                    <p style="color: var(--text-secondary); font-size: 0.8rem; margin-top: 0.25rem;">
+                        📧 ${extract.personal_information.email || '—'} &nbsp;|&nbsp; 📞 ${extract.personal_information.phone || '—'} &nbsp;|&nbsp; 📍 ${extract.personal_information.location || '—'}
+                    </p>
+                </div>
+                <div style="text-align: center;">
+                    <div style="font-size: 2.8rem; font-weight: 800; color: ${scoreColor}; text-shadow: 0 0 20px ${scoreGlow}; line-height: 1;">${score}</div>
+                    <div style="font-size: 0.65rem; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.12em; margin-top: 0.4rem;">Match Score</div>
+                </div>
+            </div>
+
+            <!-- Section Header -->
+            <div style="font-size: 0.9rem; font-weight: 600; color: var(--accent-indigo); margin-bottom: 1rem; display: flex; align-items: center; gap: 0.5rem;">
+                🎯 JD Match Parameters
+            </div>
+
+            <!-- Parameter Cards Grid -->
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem;">
+                ${paramCards}
+            </div>
+
+            <!-- Actions -->
+            <div style="margin-top: 2rem; display: flex; gap: 1rem;">
+                <a href="/outreach" class="btn btn-primary" style="flex: 1; text-align: center;">Proceed to Outreach</a>
+                <button onclick="document.getElementById('actualResults').style.display='none'; document.getElementById('previewView').style.display='block';" class="btn" style="background: var(--card-bg);">Back to Preview</button>
+            </div>
+        </div>
+    `;
+
+        document.getElementById('analyzeBtn').disabled = false;
+        document.getElementById('analyzeBtn').innerHTML = '<i class="fa-solid fa-wand-magic-sparkles"></i> Start AI Analysis';
+        document.getElementById('progressContainer').style.display = 'none';
+    }
+
+    initPage();
+</script>
+{% endblock %}

@@ -15,3 +15,6 @@ extracted_txt_resumes
 parsed_jd_cache
 tmp_resumes
 experiment_files/extracted_json_output
+call_transcribe/node_modules
+call_transcribe/results
+.env.local
