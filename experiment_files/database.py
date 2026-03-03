@@ -19,11 +19,12 @@ Usage
 import os
 import re
 import json
-from typing import Optional
+from typing import Optional, List, Dict
 from contextlib import contextmanager
 
 import psycopg2
 import psycopg2.extras
+from psycopg2.extras import Json
 from werkzeug.security import generate_password_hash, check_password_hash
 from dotenv import load_dotenv
 
@@ -117,7 +118,9 @@ def init_db() -> None:
             outreach_sent_at    TIMESTAMP,
             meeting_link        TEXT,
             screened_at         TIMESTAMP DEFAULT NOW(),
-            raw_json            TEXT
+            raw_json            TEXT,
+            form_responses      JSONB,
+            selection_status    TEXT DEFAULT 'Pending'
         );
         """)
 
@@ -257,6 +260,15 @@ def get_candidates_for_role(role_name: str) -> list:
         return [dict(r) for r in cur.fetchall()]
 
 
+def get_unsynced_candidates() -> List[Dict]:
+    """Return candidates who do NOT yet have form_responses."""
+    with _cursor() as cur:
+        cur.execute(
+            "SELECT email, full_name, role_name FROM candidates WHERE form_responses IS NULL"
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
 def get_all_candidates(min_score: int = 0) -> list:
     with _cursor() as cur:
         cur.execute(
@@ -285,6 +297,47 @@ def mark_outreach_sent(candidate_id: int, meeting_link: str = "") -> None:
                WHERE id = %s""",
             (meeting_link, candidate_id),
         )
+
+
+def update_candidate_form_response(email: str, response_json: dict) -> bool:
+    """Update candidate form responses based on email match."""
+    # Ensure it's a dict
+    if not isinstance(response_json, dict):
+        print(f"[DB ERROR] response_json is not a dict: {type(response_json)}")
+        return False
+
+    with _cursor(commit=True) as cur:
+        try:
+            # Explicitly cast to jsonb to avoid any ambiguity
+            sql = "UPDATE candidates SET form_responses = %s::jsonb WHERE email = %s"
+            cur.execute(sql, (Json(response_json), email))
+            return cur.rowcount > 0
+        except Exception as e:
+            print(f"[DB ERROR] Failed to update form_responses for {email}: {e}")
+            print(f"[DB ERROR] Data attempted: {json.dumps(response_json, indent=2)}")
+            raise e
+
+
+def update_candidate_selection_status(candidate_id: int, status: str) -> bool:
+    """Update selection status for a candidate."""
+    with _cursor(commit=True) as cur:
+        cur.execute(
+            "UPDATE candidates SET selection_status = %s WHERE id = %s",
+            (status, candidate_id),
+        )
+        return cur.rowcount > 0
+
+
+def bulk_update_candidate_status(candidate_ids: list, status: str) -> int:
+    """Update selection status for multiple candidates at once."""
+    if not candidate_ids:
+        return 0
+    with _cursor(commit=True) as cur:
+        cur.execute(
+            "UPDATE candidates SET selection_status = %s WHERE id IN %s",
+            (status, tuple(candidate_ids)),
+        )
+        return cur.rowcount
 
 
 def delete_candidate(candidate_id: int) -> None:

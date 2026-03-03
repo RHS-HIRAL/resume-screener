@@ -19,3 +19,4 @@ flask
 flask-login
 flask-cors
 openai-whisper
+pytesseract

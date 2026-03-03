@@ -48,14 +48,19 @@ from database import (
     create_user,
     verify_user,
     get_user_by_username,
-    get_all_candidates,
+    delete_candidate,
     get_all_jobs,
     get_stats,
-    get_candidate_by_id,
-    save_candidate,
+    get_all_candidates,
     mark_outreach_sent,
+    update_candidate_selection_status,
+    update_candidate_form_response,
+    get_unsynced_candidates,
+    save_candidate,
+    get_candidate_by_id,
     get_jd_text,
     extract_job_code,
+    bulk_update_candidate_status,
 )
 from sharepoint_helper import SharePointMatchScoreUpdater
 
@@ -331,6 +336,86 @@ def push_to_sharepoint(filename, metadata, role_hint=""):
         print(f"[SP ERROR] Sync failed: {e}")
 
 
+def sync_ms_form_responses():
+    """Background function to fetch and sync MS Form Excel data."""
+    try:
+        print("[SYNC] Starting MS Form sync...")
+        cfg = _sp_config()
+        updater = SharePointMatchScoreUpdater(**cfg)
+
+        # Exact file name provided by user
+        excel_filename = "candidate information"
+        rows = []
+        try:
+            # 1. Try SharePoint (Shared Site)
+            print(f"[SYNC] Searching for '{excel_filename}' in SharePoint...")
+            rows = updater.get_excel_rows(excel_filename)
+
+            # 2. Try OneDrive (Personal) if SharePoint fails
+            if not rows:
+                user_email = os.getenv("MAILBOX_USER")
+                # Prioritize deep.malusare because we confirmed the file is there
+                possible_emails = ["deep.malusare@si2tech.com", user_email]
+                for email in possible_emails:
+                    if not email:
+                        continue
+                    print(
+                        f"[SYNC] SharePoint failed or skipped .url. Trying OneDrive for {email}..."
+                    )
+                    rows = updater.get_onedrive_excel_rows(email, excel_filename)
+                    if rows:
+                        print(
+                            f"[SYNC] Successfully found and read Excel from {email}'s OneDrive."
+                        )
+                        break
+
+        except Exception as e:
+            print(f"[SYNC] Error during file fetch: {e}")
+            return 0
+
+        if not rows:
+            print("[SYNC] No rows found in MS Form Excel.")
+            return 0
+
+        # Optimization: Only match against candidates who don't have responses yet
+        unsynced = get_unsynced_candidates()
+        unsynced_emails = {c["email"].lower(): c["full_name"] for c in unsynced}
+
+        if not unsynced_emails:
+            print("[SYNC] All candidates already have form responses. Skipping.")
+            return 0
+
+        print(
+            f"[SYNC] Found {len(rows)} rows to process. Target candidates: {len(unsynced_emails)}"
+        )
+        sync_count = 0
+        for row in rows:
+            try:
+                # Match by "Email Address" as specified by user
+                email = row.get("Email Address") or row.get("Email") or row.get("email")
+
+                if email:
+                    email_clean = str(email).strip().lower()
+                    if email_clean in unsynced_emails:
+                        print(
+                            f"[SYNC] New response found for: {unsynced_emails[email_clean]} ({email_clean})"
+                        )
+                        updated = update_candidate_form_response(email_clean, row)
+                        if updated:
+                            sync_count += 1
+                    # Note: We skip if already synced as per user request
+                else:
+                    print(f"[SYNC] Row skipped - no 'Email Address' column found.")
+            except Exception as e:
+                print(f"[SYNC ERROR] Error processing row: {e}")
+
+        print(f"[SYNC] Finished. Updated {sync_count} candidates.")
+        return sync_count
+    except Exception as e:
+        print(f"[SYNC ERROR] {e}")
+        return 0
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # AUTH ROUTES
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -400,6 +485,70 @@ def screener():
 def outreach():
     roles = get_all_jobs()
     return render_template("outreach.html", roles=roles)
+
+
+@app.route("/responses")
+@login_required
+def responses():
+    """Review Dashboard."""
+    roles = get_all_jobs()
+    return render_template("responses.html", roles=roles)
+
+
+@app.route("/api/sync-responses", methods=["POST"])
+@login_required
+def api_sync_responses():
+    """Manual trigger for MS Form sync."""
+    count = sync_ms_form_responses()
+    return jsonify({"success": True, "updated_count": count})
+
+
+@app.route("/api/candidate/status", methods=["POST"])
+@login_required
+def api_update_status():
+    """Update selection status and sync to SharePoint."""
+    data = request.json
+    cid = data.get("candidate_id")
+    status = data.get("status")
+
+    if not cid or not status:
+        return jsonify({"error": "Missing id or status"}), 400
+
+    try:
+        updated = update_candidate_selection_status(cid, status)
+        if not updated:
+            return jsonify({"error": "Candidate not found"}), 404
+
+        # Optional: Sync status back to SharePoint
+        candidate = get_candidate_by_id(cid)
+        if candidate and candidate.get("resume_filename"):
+            metadata = {"SelectionStatus": status}
+            threading.Thread(
+                target=push_to_sharepoint,
+                args=(candidate["resume_filename"], metadata, candidate["role_name"]),
+            ).start()
+
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/candidate/status/bulk", methods=["POST"])
+@login_required
+def api_bulk_update_status():
+    """Update selection status for multiple candidates."""
+    data = request.json
+    cids = data.get("candidate_ids")
+    status = data.get("status")
+
+    if not cids or not status:
+        return jsonify({"error": "Missing ids or status"}), 400
+
+    try:
+        count = bulk_update_candidate_status(cids, status)
+        return jsonify({"success": True, "updated_count": count})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

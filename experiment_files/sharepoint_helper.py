@@ -2,6 +2,8 @@ import os
 import re
 import requests
 import msal
+import pandas as pd
+import io
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -92,10 +94,15 @@ class SharePointMatchScoreUpdater:
         from urllib.parse import quote as _quote
 
         drive_id = self._get_drive_id()
-        encoded = _quote(folder_path.strip("/"), safe="/")
-
+        folder_stripped = folder_path.strip("/")
         expand = "&$expand=listItem($expand=fields)" if include_fields else ""
-        url = f"{self.GRAPH_BASE}/drives/{drive_id}/root:/{encoded}:/children?$select=id,name,file,folder&$top=999{expand}"
+
+        if not folder_stripped:
+            # Root folder
+            url = f"{self.GRAPH_BASE}/drives/{drive_id}/root/children?$select=id,name,file,folder&$top=999{expand}"
+        else:
+            encoded = _quote(folder_stripped, safe="/")
+            url = f"{self.GRAPH_BASE}/drives/{drive_id}/root:/{encoded}:/children?$select=id,name,file,folder&$top=999{expand}"
 
         print(f"[DEBUG] SharePoint _list_folder_children: {folder_path}")
 
@@ -260,3 +267,141 @@ class SharePointMatchScoreUpdater:
         if resp.status_code == 200:
             return ("OK", f"Metadata updated successfully for `{filename}`.", [])
         return ("ERROR", f"SharePoint Error {resp.status_code}: {resp.text[:200]}", [])
+
+    def get_excel_rows(self, filename: str) -> list[dict]:
+        """Search for an Excel file and return its rows as a list of dicts using pandas."""
+        drive_id = self._get_drive_id()
+
+        # 1. Search for the file (standard way)
+        candidates = self.find_matching_items(filename)
+        if not candidates and not filename.endswith(".xlsx"):
+            candidates = self.find_matching_items(filename + ".xlsx")
+
+        if not candidates:
+            # 2. Brute force search in common folders
+            print(
+                f"[SP] Global search failed for '{filename}'. Trying common folders..."
+            )
+            for folder in ["/", "General", "Recordings"]:
+                try:
+                    items = self._list_folder_children(folder)
+                    candidates = [
+                        i
+                        for i in items
+                        if i["name"].lower().startswith(filename.lower())
+                    ]
+                    if candidates:
+                        print(f"[SP] Found file in folder '{folder}'")
+                        break
+                except:
+                    continue
+
+        if not candidates:
+            print(f"[SP] Excel file '{filename}' not found anywhere.")
+            return []
+
+        # Strictly require .xlsx extension
+        xlsx_candidates = [c for c in candidates if c["name"].lower().endswith(".xlsx")]
+        if not xlsx_candidates:
+            print(f"[SP] No actual .xlsx files found for '{filename}'.")
+            return []
+
+        item = xlsx_candidates[0]
+        for c in xlsx_candidates:
+            if (
+                c["name"].lower() == filename.lower()
+                or c["name"].lower() == (filename + ".xlsx").lower()
+            ):
+                item = c
+                break
+
+        item_id = item["id"]
+        print(f"[SP] Downloading Excel file: {item['name']} (ID: {item_id})")
+
+        # 3. Download file content
+        content_url = f"{self.GRAPH_BASE}/drives/{drive_id}/items/{item_id}/content"
+        resp = requests.get(
+            content_url, headers=self._headers(), timeout=60, allow_redirects=True
+        )
+        if not resp.ok:
+            print(f"[SP] Failed to download Excel: {resp.text}")
+            return []
+
+        # 4. Read with pandas (as requested by user)
+        try:
+            df = pd.read_excel(io.BytesIO(resp.content), engine="openpyxl")
+            # 1. Convert Timestamps to strings for JSON serializability
+            for col in df.select_dtypes(include=["datetime", "datetimetz"]).columns:
+                df[col] = df[col].dt.strftime("%Y-%m-%d %H:%M:%S")
+
+            # 2. Convert NaN to None for JSON compatibility (Postgres JSONB doesn't support NaN)
+            df = df.astype(object).where(pd.notnull(df), None)
+
+            return df.to_dict(orient="records")
+        except Exception as e:
+            print(f"[SP] Pandas error reading Excel: {e}")
+            return []
+
+    def get_onedrive_excel_rows(self, user_email: str, filename: str) -> list[dict]:
+        """Search for an Excel file in a specific user's OneDrive and return its rows."""
+        # 1. Search in user's drive
+        search_url = (
+            f"{self.GRAPH_BASE}/users/{user_email}/drive/root/search(q='{filename}')"
+        )
+        resp = requests.get(search_url, headers=self._headers(), timeout=30)
+        if not resp.ok:
+            print(f"[OneDrive] Search failed for {user_email}: {resp.text}")
+            return []
+
+        results = resp.json().get("value", [])
+        if not results:
+            print(f"[OneDrive] File '{filename}' not found in {user_email}'s drive.")
+            return []
+
+        # Strictly require .xlsx extension
+        xlsx_results = [r for r in results if r["name"].lower().endswith(".xlsx")]
+        if not xlsx_results:
+            print(f"[OneDrive] No actual .xlsx files found in {user_email}'s drive.")
+            return []
+
+        item = xlsx_results[0]
+        for r in xlsx_results:
+            if (
+                r["name"].lower() == filename.lower()
+                or r["name"].lower() == (filename + ".xlsx").lower()
+            ):
+                item = r
+                break
+
+        item_id = item["id"]
+        print(
+            f"[OneDrive] Downloading from {user_email}: {item['name']} (ID: {item_id})"
+        )
+
+        # 2. Download
+        content_url = (
+            f"{self.GRAPH_BASE}/users/{user_email}/drive/items/{item_id}/content"
+        )
+        resp = requests.get(
+            content_url, headers=self._headers(), timeout=60, allow_redirects=True
+        )
+        if not resp.ok:
+            print(f"[OneDrive] Download failed: {resp.text}")
+            return []
+
+        # 3. Parse with pandas
+        try:
+            df = pd.read_excel(io.BytesIO(resp.content), engine="openpyxl")
+
+            # 1. Convert Timestamps to strings for JSON serializability
+            for col in df.select_dtypes(include=["datetime", "datetimetz"]).columns:
+                df[col] = df[col].dt.strftime("%Y-%m-%d %H:%M:%S")
+
+            # 2. Convert NaN to None for JSON compatibility (Postgres JSONB doesn't support NaN)
+            # Casting to object ensures None stays None and doesn't revert to NaN
+            df = df.astype(object).where(pd.notnull(df), None)
+
+            return df.to_dict(orient="records")
+        except Exception as e:
+            print(f"[OneDrive] Pandas error: {e}")
+            return []

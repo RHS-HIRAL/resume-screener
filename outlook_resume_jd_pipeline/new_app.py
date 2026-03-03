@@ -1,46 +1,59 @@
-import json
+"""
+jd_pipeline.py — Unified Job Description Pipeline
+════════════════════════════════════════════════════
+Single-pass pipeline that processes each job listing end-to-end:
+
+  For each job discovered on the website:
+    1. Parse the job detail page into structured data.
+    2. Generate a branded PDF and upload to SharePoint (JobDescriptions/).
+    3. Convert the structured data to plain text in memory and upload to
+       SharePoint (Text Files/JobDescriptions/<slug>.txt).
+
+  No intermediate JSON files are saved. Everything flows through memory
+  per job — the only disk I/O is temporary PDFs during generation.
+
+Usage:
+    python jd_pipeline.py
+"""
+
+import logging
 import os
+import re
 import shutil
 import sys
-import re
-import logging
 import time
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
-from dataclasses import dataclass, field, asdict
 from urllib.parse import quote, urljoin
 
 import msal
 import requests
-from dotenv import load_dotenv
 from bs4 import BeautifulSoup
-
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import inch
+from dotenv import load_dotenv
 from reportlab.lib.colors import HexColor
-from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_JUSTIFY
+from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import inch
 from reportlab.platypus import (
-    SimpleDocTemplate,
+    HRFlowable,
     Paragraph,
+    SimpleDocTemplate,
     Spacer,
     Table,
     TableStyle,
-    HRFlowable,
 )
 
 load_dotenv()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  CONFIG
+#  CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-class config:
-    """
-    Configuration for the Job Description Pipeline.
-    All values are loaded from environment variables or a .env file.
-    """
+class Config:
+    """All values loaded from environment variables or .env file."""
 
     # ─── Entra ID (Azure AD) Credentials ────────────────────────────────────
     TENANT_ID = os.getenv("AZURE_TENANT_ID", "")
@@ -60,34 +73,55 @@ class config:
     SHAREPOINT_DRIVE_NAME = os.getenv("SHAREPOINT_DRIVE_NAME", "Documents")
     SHAREPOINT_JD_FOLDER = os.getenv("SHAREPOINT_JD_FOLDER", "JobDescriptions")
 
+    # ─── Text Files Target ─────────────────────────────────────────────────
+    TEXT_JD_FOLDER = os.getenv(
+        "SHAREPOINT_TEXT_JD_FOLDER", "Text Files/JobDescriptions"
+    )
+
     # ─── Website to Scrape ───────────────────────────────────────────────────
     JOBS_ARCHIVE_URL = os.getenv("JOBS_ARCHIVE_URL", "https://si2tech.com/jobs/")
     SITE_BASE_URL = os.getenv("SITE_BASE_URL", "https://si2tech.com")
 
     # ─── Scraping ────────────────────────────────────────────────────────────
-    REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "1.5"))  # polite delay (seconds)
+    REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "1.5"))
     REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
-    MAX_PAGES = int(os.getenv("MAX_PAGES", "20"))  # safety cap on pagination
+    MAX_PAGES = int(os.getenv("MAX_PAGES", "20"))
 
     # ─── Logging ─────────────────────────────────────────────────────────────
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
     LOG_FILE = os.getenv("JD_LOG_FILE", "logs/jd_pipeline.log")
 
-    # ─── Local Temp Directory ────────────────────────────────────────────────
+    # ─── Local Temp Directory (PDF generation only) ──────────────────────────
     TEMP_DIR = os.getenv("JD_TEMP_DIR", "./tmp_job_descriptions")
 
     # ─── Notifications ───────────────────────────────────────────────────────
     TEAMS_WEBHOOK_URL = os.getenv("TEAMS_WEBHOOK_URL", "")
 
-    # ─── JD JSON Export Directory ─────────────────────────────────────────
-    JD_JSON_DIR = os.getenv("JD_JSON_DIR", "../extracted_json_jd")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  LOGGING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def setup_logging():
+    os.makedirs(os.path.dirname(Config.LOG_FILE) or ".", exist_ok=True)
+    logging.basicConfig(
+        level=getattr(logging, Config.LOG_LEVEL.upper(), logging.INFO),
+        format="%(asctime)s │ %(levelname)-7s │ %(name)-22s │ %(message)s",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler(Config.LOG_FILE, encoding="utf-8"),
+        ],
+    )
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+
+logger = logging.getLogger("jd_pipeline")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  AUTH  (same as app.py)
+#  AUTH — Unified Microsoft Graph Authentication
 # ═══════════════════════════════════════════════════════════════════════════════
-
-logger_auth = logging.getLogger("auth")
 
 
 class GraphAuthProvider:
@@ -95,22 +129,21 @@ class GraphAuthProvider:
 
     def __init__(self):
         self._app = msal.ConfidentialClientApplication(
-            client_id=config.CLIENT_ID,
-            client_credential=config.CLIENT_SECRET,
-            authority=config.AUTHORITY,
+            client_id=Config.CLIENT_ID,
+            client_credential=Config.CLIENT_SECRET,
+            authority=Config.AUTHORITY,
         )
 
     def get_access_token(self) -> str:
-        result = self._app.acquire_token_silent(config.SCOPES, account=None)
+        result = self._app.acquire_token_silent(Config.SCOPES, account=None)
         if not result:
-            logger_auth.info("Acquiring new token via client credentials.")
-            result = self._app.acquire_token_for_client(scopes=config.SCOPES)
+            logger.info("Acquiring new token via client credentials.")
+            result = self._app.acquire_token_for_client(scopes=Config.SCOPES)
 
         if "access_token" in result:
             return result["access_token"]
 
         error = result.get("error_description", result.get("error", "Unknown error"))
-        logger_auth.error("Token acquisition failed: %s", error)
         raise RuntimeError(f"Could not acquire token: {error}")
 
     def get_headers(self) -> dict:
@@ -129,7 +162,7 @@ class GraphAuthProvider:
 class JobDescription:
     """Structured data extracted from one job detail page."""
 
-    slug: str = ""  # URL slug used as unique ID
+    slug: str = ""
     title: str = ""
     url: str = ""
 
@@ -158,10 +191,327 @@ class JobDescription:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  WEBSITE SCRAPER
+#  SHAREPOINT MANAGER — Unified Upload, Listing, Metadata for Both Phases
 # ═══════════════════════════════════════════════════════════════════════════════
 
-logger_scraper = logging.getLogger("scraper")
+# Maps code-side keys to SharePoint custom column internal names.
+JD_FIELD_MAP = {
+    "JDTitle": "JDTitle",
+    "JDLocation": "JDLocation",
+    "JDJobType": "JDJobType",
+    "JDDepartment": "JDDepartment",
+    "JDExperience": "JDExperience",
+    "JDJobCategory": "JDJobCategory",
+    "JDScrapedDate": "JDScrapedDate",
+    "JDSourceURL": "JDSourceURL",
+    "Title": "Title",
+}
+
+
+class SharePointManager:
+    """
+    Single class for all SharePoint operations:
+    - PDF upload + metadata tagging
+    - Text file upload + metadata tagging (in-memory content)
+    - File existence checks, folder management
+    """
+
+    def __init__(self, auth_headers: dict):
+        self.headers = auth_headers
+        self.base = Config.GRAPH_BASE_URL
+        self._site_id: str | None = None
+        self._drive_id: str | None = None
+        self._ensured_folders: set[str] = set()
+        self._existing_jd_pdfs: set[str] | None = None
+
+    # ── Site & Drive Resolution ───────────────────────────────────────────────
+
+    def _get_site_id(self) -> str:
+        if self._site_id:
+            return self._site_id
+        domain = Config.SHAREPOINT_SITE_DOMAIN
+        path = Config.SHAREPOINT_SITE_PATH.strip("/")
+        url = f"{self.base}/sites/{domain}:/{path}"
+        resp = requests.get(url, headers=self.headers, timeout=30)
+        resp.raise_for_status()
+        self._site_id = resp.json()["id"]
+        return self._site_id
+
+    def _get_drive_id(self) -> str:
+        if self._drive_id:
+            return self._drive_id
+        url = f"{self.base}/sites/{self._get_site_id()}/drives"
+        resp = requests.get(url, headers=self.headers, timeout=30)
+        resp.raise_for_status()
+        drives = resp.json().get("value", [])
+        target = Config.SHAREPOINT_DRIVE_NAME
+        for d in drives:
+            if d["name"].lower() == target.lower():
+                self._drive_id = d["id"]
+                return self._drive_id
+        if drives:
+            self._drive_id = drives[0]["id"]
+            logger.warning(
+                "Drive '%s' not found — using default '%s'.", target, drives[0]["name"]
+            )
+            return self._drive_id
+        raise RuntimeError("No drives found on SharePoint site.")
+
+    # ── Folder Management ─────────────────────────────────────────────────────
+
+    def _ensure_folder(self, drive_id: str, folder_path: str) -> None:
+        if folder_path in self._ensured_folders:
+            return
+        current = ""
+        for part in folder_path.strip("/").split("/"):
+            current = f"{current}/{part}" if current else part
+            if current in self._ensured_folders:
+                continue
+
+            check_url = f"{self.base}/drives/{drive_id}/root:/{quote(current)}"
+            if (
+                requests.get(check_url, headers=self.headers, timeout=15).status_code
+                == 404
+            ):
+                if "/" in current:
+                    parent_encoded = quote("/".join(current.split("/")[:-1]))
+                    create_url = (
+                        f"{self.base}/drives/{drive_id}/root:/"
+                        f"{parent_encoded}:/children"
+                    )
+                else:
+                    create_url = f"{self.base}/drives/{drive_id}/root/children"
+
+                requests.post(
+                    create_url,
+                    headers=self.headers,
+                    json={
+                        "name": part,
+                        "folder": {},
+                        "@microsoft.graph.conflictBehavior": "fail",
+                    },
+                    timeout=15,
+                )
+            self._ensured_folders.add(current)
+
+    # ── File Existence (Generic) ──────────────────────────────────────────────
+
+    def file_exists(self, remote_path: str) -> bool:
+        """Check if a file exists at an arbitrary SharePoint path."""
+        drive_id = self._get_drive_id()
+        encoded = quote(remote_path.strip("/"))
+        url = f"{self.base}/drives/{drive_id}/root:/{encoded}"
+        try:
+            resp = requests.get(url, headers=self.headers, timeout=10)
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+    # ── Cached PDF Existence (optimisation) ─────────────────────────────────
+
+    def jd_pdf_exists(self, filename: str) -> bool:
+        """Check if a JD PDF exists in the JD folder (cached list)."""
+        if self._existing_jd_pdfs is None:
+            self._existing_jd_pdfs = self._list_existing_jd_pdfs()
+        return filename.lower() in self._existing_jd_pdfs
+
+    def _list_existing_jd_pdfs(self) -> set[str]:
+        try:
+            drive_id = self._get_drive_id()
+            folder = Config.SHAREPOINT_JD_FOLDER.strip("/")
+            url = (
+                f"{self.base}/drives/{drive_id}/root:/{quote(folder)}:/children"
+                f"?$select=name&$top=1000"
+            )
+            filenames: set[str] = set()
+            while url:
+                resp = requests.get(url, headers=self.headers, timeout=30)
+                if resp.status_code == 404:
+                    return set()
+                resp.raise_for_status()
+                data = resp.json()
+                for item in data.get("value", []):
+                    filenames.add(item["name"].lower())
+                url = data.get("@odata.nextLink")
+            logger.info(
+                "Found %d existing PDFs in SharePoint:/%s/", len(filenames), folder
+            )
+            return filenames
+        except Exception as e:
+            logger.warning("Could not list existing JD PDFs: %s", e)
+            return set()
+
+    # ── Upload Methods ────────────────────────────────────────────────────────
+
+    def _get_content_type(self, filename: str) -> str:
+        ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+        return {
+            "pdf": "application/pdf",
+            "txt": "text/plain; charset=utf-8",
+            "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "json": "application/json",
+        }.get(ext, "application/octet-stream")
+
+    def _simple_upload(
+        self, drive_id: str, folder: str, filename: str, file_path: str
+    ) -> dict:
+        encoded_path = quote(f"{folder}/{filename}")
+        url = f"{self.base}/drives/{drive_id}/root:/{encoded_path}:/content"
+        headers = {**self.headers, "Content-Type": self._get_content_type(filename)}
+        with open(file_path, "rb") as f:
+            resp = requests.put(url, headers=headers, data=f, timeout=120)
+        resp.raise_for_status()
+        return resp.json()
+
+    def _resumable_upload(
+        self, drive_id: str, folder: str, filename: str, file_path: str, file_size: int
+    ) -> dict:
+        encoded_path = quote(f"{folder}/{filename}")
+        url = f"{self.base}/drives/{drive_id}/root:/{encoded_path}:/createUploadSession"
+        body = {
+            "item": {
+                "@microsoft.graph.conflictBehavior": "replace",
+                "name": filename,
+            }
+        }
+        resp = requests.post(url, headers=self.headers, json=body, timeout=30)
+        resp.raise_for_status()
+        upload_url = resp.json()["uploadUrl"]
+
+        chunk_size = 4 * 1024 * 1024
+        with open(file_path, "rb") as f:
+            offset = 0
+            while offset < file_size:
+                chunk = f.read(chunk_size)
+                end = offset + len(chunk) - 1
+                chunk_headers = {
+                    "Content-Length": str(len(chunk)),
+                    "Content-Range": f"bytes {offset}-{end}/{file_size}",
+                }
+                resp = requests.put(
+                    upload_url, headers=chunk_headers, data=chunk, timeout=120
+                )
+                resp.raise_for_status()
+                offset += len(chunk)
+        return resp.json()
+
+    def _upload_file(self, folder: str, filename: str, file_path: str) -> dict:
+        """Upload a file to a SharePoint folder. Handles small vs large files."""
+        drive_id = self._get_drive_id()
+        self._ensure_folder(drive_id, folder)
+
+        file_size = os.path.getsize(file_path)
+        if file_size < 4 * 1024 * 1024:
+            return self._simple_upload(drive_id, folder, filename, file_path)
+        else:
+            return self._resumable_upload(
+                drive_id, folder, filename, file_path, file_size
+            )
+
+    def _upload_content(self, folder: str, filename: str, content: bytes) -> dict:
+        """Upload raw bytes/text content to SharePoint without a temp file."""
+        drive_id = self._get_drive_id()
+        self._ensure_folder(drive_id, folder)
+        encoded_path = quote(f"{folder}/{filename}")
+        url = f"{self.base}/drives/{drive_id}/root:/{encoded_path}:/content"
+        headers = {**self.headers, "Content-Type": self._get_content_type(filename)}
+        resp = requests.put(url, headers=headers, data=content, timeout=60)
+        resp.raise_for_status()
+        return resp.json()
+
+    # ── Metadata ──────────────────────────────────────────────────────────────
+
+    def set_metadata(self, item_id: str, metadata: dict) -> None:
+        """Set custom column values on an uploaded file's SharePoint list item."""
+        if not item_id or item_id == "resumable_upload_complete":
+            return
+        drive_id = self._get_drive_id()
+        url = f"{self.base}/drives/{drive_id}/items/{item_id}/listItem/fields"
+        fields = {
+            JD_FIELD_MAP[k]: v for k, v in metadata.items() if k in JD_FIELD_MAP and v
+        }
+        if not fields:
+            return
+
+        resp = requests.patch(url, headers=self.headers, json=fields, timeout=30)
+        if resp.status_code == 200:
+            logger.info("  Metadata set on item %s: %s", item_id, list(fields.keys()))
+        else:
+            # Retry with only standard 'Title' if custom fields fail
+            if any(k != "Title" for k in fields):
+                logger.warning(
+                    "  Metadata patch partial failure (%d). Retrying with safe fields.",
+                    resp.status_code,
+                )
+                safe_fields = {k: v for k, v in fields.items() if k == "Title"}
+                if safe_fields:
+                    requests.patch(
+                        url, headers=self.headers, json=safe_fields, timeout=30
+                    )
+            else:
+                logger.warning(
+                    "  Metadata patch failed (%d): %s",
+                    resp.status_code,
+                    resp.text[:200],
+                )
+
+    # ── Upload JD PDF ─────────────────────────────────────────────────────
+
+    def upload_jd_pdf(
+        self, file_path: str, target_filename: str, metadata: dict | None = None
+    ) -> dict:
+        """Upload a JD PDF to JobDescriptions/ and tag with metadata."""
+        folder = Config.SHAREPOINT_JD_FOLDER.strip("/")
+        item = self._upload_file(folder, target_filename, file_path)
+
+        logger.info(
+            "  Uploaded PDF '%s' → SharePoint:/%s/ (id: %s)",
+            target_filename,
+            folder,
+            item.get("id"),
+        )
+
+        if metadata:
+            self.set_metadata(item["id"], metadata)
+
+        if self._existing_jd_pdfs is not None:
+            self._existing_jd_pdfs.add(target_filename.lower())
+
+        return item
+
+    # ── Upload JD Text File ───────────────────────────────────────────────
+
+    def upload_jd_text(
+        self,
+        text_content: str,
+        filename: str,
+        metadata: dict | None = None,
+        skip_existing: bool = True,
+    ) -> dict | None:
+        """
+        Upload a .txt JD file to Text Files/JobDescriptions/.
+        Returns the Graph API response dict, or None if skipped.
+        """
+        folder = Config.TEXT_JD_FOLDER.strip("/")
+        remote_path = f"{folder}/{filename}"
+
+        if skip_existing and self.file_exists(remote_path):
+            logger.info("  ⏭️  Skipping (already exists): %s", filename)
+            return None
+
+        item = self._upload_content(folder, filename, text_content.encode("utf-8"))
+
+        logger.info("  ✅ Uploaded text: %s (id: %s)", filename, item.get("id"))
+
+        if metadata:
+            self.set_metadata(item["id"], metadata)
+
+        return item
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  WEBSITE SCRAPER
+# ═══════════════════════════════════════════════════════════════════════════════
 
 # HTTP session with browser-like headers for polite scraping
 _session = requests.Session()
@@ -180,8 +530,8 @@ _session.headers.update(
 
 def _polite_get(url: str) -> requests.Response:
     """GET with a polite delay between requests."""
-    time.sleep(config.REQUEST_DELAY)
-    resp = _session.get(url, timeout=config.REQUEST_TIMEOUT)
+    time.sleep(Config.REQUEST_DELAY)
+    resp = _session.get(url, timeout=Config.REQUEST_TIMEOUT)
     resp.raise_for_status()
     return resp
 
@@ -192,31 +542,26 @@ def _polite_get(url: str) -> requests.Response:
 def discover_job_urls() -> list[dict]:
     """
     Crawl the WordPress job archive at /jobs/, /jobs/page/2/, etc.
-
-    The archive pages list jobs as <h2><a href="...">Title</a></h2>.
-    Pagination is handled by following "Next" links.
-
     Returns a deduplicated list of {"url": str, "title": str}.
     """
-    jobs: dict[str, str] = {}  # url -> title
-    current_url = config.JOBS_ARCHIVE_URL
+    jobs: dict[str, str] = {}
+    current_url = Config.JOBS_ARCHIVE_URL
     page_num = 0
 
-    while current_url and page_num < config.MAX_PAGES:
+    while current_url and page_num < Config.MAX_PAGES:
         page_num += 1
-        logger_scraper.info("Crawling archive page %d: %s", page_num, current_url)
+        logger.info("Crawling archive page %d: %s", page_num, current_url)
 
         try:
             resp = _polite_get(current_url)
         except requests.HTTPError as e:
             if e.response is not None and e.response.status_code == 404:
-                logger_scraper.info("Page %d returned 404 — end of archive.", page_num)
+                logger.info("Page %d returned 404 — end of archive.", page_num)
                 break
             raise
 
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # ── Extract job links from <h2><a> inside archive listings ──
         found_on_page = 0
         for h2 in soup.find_all("h2"):
             a_tag = h2.find("a", href=True)
@@ -225,8 +570,7 @@ def discover_job_urls() -> list[dict]:
             href = a_tag["href"]
             if "/jobs/" not in href:
                 continue
-            full_url = urljoin(config.SITE_BASE_URL, href).rstrip("/") + "/"
-            # Skip archive index pages themselves
+            full_url = urljoin(Config.SITE_BASE_URL, href).rstrip("/") + "/"
             slug = full_url.rstrip("/").split("/jobs/")[-1].split("/")[0]
             if not slug or slug == "page":
                 continue
@@ -236,15 +580,15 @@ def discover_job_urls() -> list[dict]:
                 jobs[full_url] = title
                 found_on_page += 1
 
-        logger_scraper.info("  Found %d jobs on page %d.", found_on_page, page_num)
+        logger.info("  Found %d jobs on page %d.", found_on_page, page_num)
 
-        # ── Follow "Next" pagination link ──
+        # Follow "Next" pagination link
         next_link = None
         for a_tag in soup.find_all("a", href=True):
             text = a_tag.get_text(strip=True)
             href = a_tag["href"]
             if ("next" in text.lower() or "\u2192" in text) and "/jobs/page/" in href:
-                next_link = urljoin(config.SITE_BASE_URL, href)
+                next_link = urljoin(Config.SITE_BASE_URL, href)
                 break
 
         if next_link and next_link != current_url:
@@ -253,13 +597,12 @@ def discover_job_urls() -> list[dict]:
             break
 
     result = [{"url": url, "title": title} for url, title in jobs.items()]
-    logger_scraper.info("Total unique jobs discovered: %d", len(result))
+    logger.info("Total unique jobs discovered: %d", len(result))
     return result
 
 
 # ─── Step 2: Parse one job detail page ────────────────────────────────────────
 
-# Labels in <strong>Label:</strong> that map to metadata attributes.
 META_LABEL_MAP = {
     "location": "location",
     "job type": "job_type",
@@ -269,12 +612,11 @@ META_LABEL_MAP = {
     "experience": "experience",
     "job category": "job_category",
     "employment type": "employment_type",
-    "job title": "_skip",  # already captured from <h1>
+    "job title": "_skip",
     "internship title": "_skip",
     "job location": "location",
 }
 
-# Known section heading keywords.
 SECTION_KEYWORDS = [
     "job summary",
     "role overview",
@@ -326,7 +668,7 @@ def parse_job_detail(url: str, fallback_title: str = "") -> JobDescription:
         scraped_date=datetime.now().strftime("%Y-%m-%d"),
     )
 
-    # ── Title from <h1> ──
+    # Title from <h1>
     h1 = soup.find("h1")
     jd.title = h1.get_text(strip=True) if h1 else fallback_title
 
@@ -335,12 +677,10 @@ def parse_job_detail(url: str, fallback_title: str = "") -> JobDescription:
         content_div = soup.find("article")
 
     if not content_div:
-        logger_scraper.warning(
-            "No content container (entry-content/article) found for %s", url
-        )
+        logger.warning("No content container found for %s", url)
         return jd
 
-    # ── Walk elements sequentially ──
+    # Walk elements sequentially
     current_heading = "Job Description"
     current_paragraphs: list[str] = []
     current_bullets: list[str] = []
@@ -367,7 +707,6 @@ def parse_job_detail(url: str, fallback_title: str = "") -> JobDescription:
         if elem in processed_elements:
             continue
 
-        # Mark children as processed to avoid duplication if we hit a wrapper div
         for child in elem.find_all(["p", "ul", "ol", "h2", "h3", "h4", "h5"]):
             processed_elements.add(child)
 
@@ -377,11 +716,10 @@ def parse_job_detail(url: str, fallback_title: str = "") -> JobDescription:
 
         tag_name = elem.name.lower()
 
-        # ── Headers: Start new section ──
+        # Headers: start new section
         if tag_name in ("h2", "h3", "h4", "h5") or (
             tag_name == "p" and _is_section_heading(text_content)
         ):
-            # Check for "Apply" text to stop parsing
             if "apply for this position" in text_content.lower():
                 break
 
@@ -389,41 +727,32 @@ def parse_job_detail(url: str, fallback_title: str = "") -> JobDescription:
             current_heading = text_content.rstrip(":")
             continue
 
-        # ── <p> tags ──
+        # <p> tags
         if tag_name == "p":
-            is_metadata = False
-            # Regex to find "Label: Value" patterns
             match = re.match(r"^([A-Za-z\s]+)\s*[:]\s*(.*)", text_content)
             if match:
                 label, value = match.groups()
                 if _try_set_metadata(jd, label, value):
-                    is_metadata = True
+                    continue
 
-            if is_metadata:
-                continue
+            current_paragraphs.append(elem.decode_contents())
 
-            # If not metadata, treat as body text
-            current_paragraphs.append(
-                elem.decode_contents()
-            )  # Keep inline formatting like <b>
-
-        # ── <ul> / <ol> bullet lists ──
+        # <ul>/<ol> bullet lists
         elif tag_name in ("ul", "ol"):
             for li in elem.find_all("li", recursive=False):
-                # Handle nested lists or simple text
                 li_text = li.get_text(" ", strip=True)
                 if li_text:
                     current_bullets.append(li_text)
+
     _flush()
 
-    # ── Extract footer metadata if not already set ──
+    # Extract footer metadata
     _extract_footer_metadata(soup, jd)
 
     return jd
 
 
 def _try_set_metadata(jd: JobDescription, label: str, value: str) -> bool:
-    """Try to assign value to a JD metadata field. Returns True if matched."""
     label_lower = label.lower().strip()
     for key_substr, attr_name in META_LABEL_MAP.items():
         if key_substr in label_lower:
@@ -436,11 +765,9 @@ def _try_set_metadata(jd: JobDescription, label: str, value: str) -> bool:
 
 
 def _is_section_heading(text: str) -> bool:
-    """Check if bold text looks like a content section header."""
     if not text or len(text) < 3 or len(text) > 80:
         return False
     text_lower = text.lower()
-    # Skip form / nav labels
     skip_exact = {
         "apply",
         "submit",
@@ -456,21 +783,15 @@ def _is_section_heading(text: str) -> bool:
     }
     if text_lower in skip_exact:
         return False
-    # Check against known section keywords
     for kw in SECTION_KEYWORDS:
         if kw in text_lower:
             return True
-    # Accept bold text > 15 chars without a colon as a likely section heading
     if ":" not in text and len(text) < 40 and text[0].isupper():
         return True
     return False
 
 
 def _extract_footer_metadata(soup: BeautifulSoup, jd: JobDescription) -> None:
-    """
-    Extract Job Category / Job Type / Job Location from the bottom of the page.
-    These appear as lines like "Job Category: SOC Lead" after the main content.
-    """
     full_text = soup.get_text(separator="\n")
     patterns = [
         (r"Job\s+Category\s*:\s*(.+)", "job_category"),
@@ -486,21 +807,185 @@ def _extract_footer_metadata(soup: BeautifulSoup, jd: JobDescription) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  STRUCTURED FIELD EXTRACTION (for scorer compatibility)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_SKILL_HEADINGS = {
+    "must have skills",
+    "must-have skills",
+    "required skills",
+    "technical skills",
+    "key skills",
+    "core competencies",
+    "skills required",
+    "skills",
+}
+_TOOL_HEADINGS = {
+    "tools",
+    "technologies",
+    "tech stack",
+    "platforms",
+    "software",
+    "tools and technologies",
+}
+_EDUCATION_HEADINGS = {
+    "qualifications",
+    "education",
+    "academic qualifications",
+    "candidate requirements",
+    "required qualifications",
+    "eligibility",
+}
+_RESPONSIBILITY_HEADINGS = {
+    "responsibilities",
+    "key responsibilities",
+    "job description",
+    "job summary",
+    "role overview",
+    "position summary",
+    "duties",
+    "what you will do",
+}
+_GOOD_TO_HAVE_HEADINGS = {
+    "good to have",
+    "good to have skills",
+    "nice to have",
+    "preferred qualifications",
+    "preferred skills",
+    "preferred certification",
+    "certifications",
+    "certification",
+}
+
+
+def extract_structured_jd_fields(jd_dict: dict) -> dict:
+    """
+    Extract scorer-compatible structured fields from the raw JD dict.
+    Reads sections and populates required_skills, good_to_have_skills,
+    required_tools, min_education, required_experience_years, responsibilities_text.
+    Returns the original dict with these keys added/merged.
+    """
+    sections = jd_dict.get("sections", [])
+
+    required_skills: list[str] = []
+    good_to_have_skills: list[str] = []
+    required_tools: list[str] = []
+    education_bullets: list[str] = []
+    responsibilities_parts: list[str] = []
+
+    for sec in sections:
+        heading = sec.get("heading", "").strip()
+        heading_lower = heading.lower().rstrip(":")
+        bullets = sec.get("bullets", [])
+        paragraphs = sec.get("paragraphs", [])
+
+        # Skills
+        if heading_lower in _SKILL_HEADINGS or any(
+            kw in heading_lower
+            for kw in ("must have", "required skill", "technical skill", "key skill")
+        ):
+            required_skills.extend(_clean_html(b) for b in bullets if b.strip())
+            for p in paragraphs:
+                cleaned = _clean_html(p)
+                if cleaned and not cleaned.endswith(":"):
+                    required_skills.append(cleaned)
+            continue
+
+        # Tools
+        if heading_lower in _TOOL_HEADINGS or any(
+            kw in heading_lower for kw in ("tools", "technologies", "tech stack")
+        ):
+            required_tools.extend(_clean_html(b) for b in bullets if b.strip())
+            continue
+
+        # Good to have
+        if heading_lower in _GOOD_TO_HAVE_HEADINGS or any(
+            kw in heading_lower for kw in ("good to have", "nice to have", "preferred")
+        ):
+            good_to_have_skills.extend(_clean_html(b) for b in bullets if b.strip())
+            continue
+
+        # Education / Qualifications
+        if heading_lower in _EDUCATION_HEADINGS or any(
+            kw in heading_lower for kw in ("qualif", "education", "eligib")
+        ):
+            education_bullets.extend(_clean_html(b) for b in bullets if b.strip())
+            for p in paragraphs:
+                cleaned = _clean_html(p)
+                if cleaned:
+                    education_bullets.append(cleaned)
+            continue
+
+        # Responsibilities / Job Description
+        if heading_lower in _RESPONSIBILITY_HEADINGS or any(
+            kw in heading_lower
+            for kw in ("responsibilit", "job description", "job summary", "dut")
+        ):
+            for p in paragraphs:
+                cleaned = _clean_html(p)
+                if cleaned:
+                    responsibilities_parts.append(cleaned)
+            for b in bullets:
+                cleaned = _clean_html(b)
+                if cleaned:
+                    responsibilities_parts.append(cleaned)
+            continue
+
+        # Catch-all: add to responsibilities
+        for b in bullets:
+            cleaned = _clean_html(b)
+            if cleaned:
+                responsibilities_parts.append(cleaned)
+        for p in paragraphs:
+            cleaned = _clean_html(p)
+            if cleaned and not cleaned.endswith(":"):
+                responsibilities_parts.append(cleaned)
+
+    # Parse experience years
+    exp_text = jd_dict.get("experience", "") or ""
+    required_yoe = _parse_experience_years(exp_text)
+
+    min_education = "; ".join(education_bullets) if education_bullets else ""
+
+    jd_dict["required_skills"] = required_skills
+    jd_dict["good_to_have_skills"] = good_to_have_skills
+    jd_dict["required_tools"] = required_tools
+    jd_dict["min_education"] = min_education
+    jd_dict["required_experience_years"] = required_yoe
+    jd_dict["responsibilities_text"] = " ".join(responsibilities_parts)
+
+    return jd_dict
+
+
+def _clean_html(text: str) -> str:
+    if not text:
+        return ""
+    return BeautifulSoup(text, "html.parser").get_text(strip=True)
+
+
+def _parse_experience_years(text: str) -> int:
+    if not text:
+        return 0
+    m = re.search(r"(\d+)\s*[+\-–—]?", text)
+    if m:
+        return int(m.group(1))
+    return 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  PDF GENERATOR
 # ═══════════════════════════════════════════════════════════════════════════════
 
-logger_pdf = logging.getLogger("pdf_generator")
-
-# ─── Brand Colors ─────────────────────────────────────────────────────────────
-C_PRIMARY = HexColor("#0F3A68")  # Dark navy
-C_ACCENT = HexColor("#1976D2")  # Bright blue
-C_BG_LIGHT = HexColor("#EDF4FC")  # Very light blue
-C_TEXT = HexColor("#222222")  # Near-black body text
-C_SUBTLE = HexColor("#555555")  # Grey metadata / footer
-C_DIVIDER = HexColor("#B0C4DE")  # Soft blue-grey divider
+# Brand Colors
+C_PRIMARY = HexColor("#0F3A68")
+C_ACCENT = HexColor("#1976D2")
+C_BG_LIGHT = HexColor("#EDF4FC")
+C_TEXT = HexColor("#222222")
+C_SUBTLE = HexColor("#555555")
+C_DIVIDER = HexColor("#B0C4DE")
 
 
-def _build_styles() -> dict:
+def _build_pdf_styles() -> dict:
     """Custom ReportLab paragraph styles for a professional JD PDF."""
     base = getSampleStyleSheet()
     s = {}
@@ -589,22 +1074,22 @@ def _build_styles() -> dict:
 
 def generate_job_pdf(jd: JobDescription, output_path: str) -> str:
     """Generate a branded, professional PDF for a single JD. Returns output_path."""
-    styles = _build_styles()
+    styles = _build_pdf_styles()
     story: list = []
-    W = A4[0] - 1.5 * inch  # usable width
+    W = A4[0] - 1.5 * inch
 
-    # ── Header bar ──
+    # Header bar
     story.append(Paragraph("Si2 Technologies", styles["CompanyName"]))
     story.append(Spacer(1, 2))
     story.append(
         HRFlowable(width="100%", thickness=2.5, color=C_PRIMARY, spaceAfter=10)
     )
 
-    # ── Job Title ──
+    # Job Title
     story.append(Paragraph(_safe(jd.title) or "Job Description", styles["Title"]))
     story.append(Spacer(1, 4))
 
-    # ── Metadata grid ──
+    # Metadata grid
     meta_pairs = _build_meta_pairs(jd)
     if meta_pairs:
         rows = []
@@ -649,7 +1134,7 @@ def generate_job_pdf(jd: JobDescription, output_path: str) -> str:
 
     story.append(HRFlowable(width="100%", thickness=0.5, color=C_DIVIDER, spaceAfter=4))
 
-    # ── Content sections ──
+    # Content sections
     for section in jd.sections:
         heading = section["heading"]
         paragraphs = section.get("paragraphs", [])
@@ -658,18 +1143,17 @@ def generate_job_pdf(jd: JobDescription, output_path: str) -> str:
         if not paragraphs and not bullets:
             continue
 
-        # Section heading with accent bar
         story.append(Spacer(1, 4))
         accent_hex = C_ACCENT.hexval()[2:]
-        heading_para = Paragraph(
-            f'<font color="#{accent_hex}">|</font>&nbsp;&nbsp;{_safe(heading)}',
-            styles["SectionHeading"],
+        story.append(
+            Paragraph(
+                f'<font color="#{accent_hex}">|</font>&nbsp;&nbsp;{_safe(heading)}',
+                styles["SectionHeading"],
+            )
         )
-        story.append(heading_para)
 
         for p in paragraphs:
             if "<b>" in p:
-                # Already contains safe markup from parsing
                 story.append(Paragraph(p, styles["BodyBold"]))
             else:
                 story.append(Paragraph(_safe(p), styles["Body"]))
@@ -677,28 +1161,16 @@ def generate_job_pdf(jd: JobDescription, output_path: str) -> str:
         for b in bullets:
             if b.startswith("    "):
                 story.append(
-                    Paragraph(
-                        f"\u2013  {_safe(b.strip())}",
-                        styles["SubBullet"],
-                    )
+                    Paragraph(f"\u2013  {_safe(b.strip())}", styles["SubBullet"])
                 )
             else:
-                story.append(
-                    Paragraph(
-                        f"\u2022  {_safe(b)}",
-                        styles["Bullet"],
-                    )
-                )
+                story.append(Paragraph(f"\u2022  {_safe(b)}", styles["Bullet"]))
 
-    # ── Footer ──
+    # Footer
     story.append(Spacer(1, 20))
     story.append(
         HRFlowable(
-            width="100%",
-            thickness=0.5,
-            color=C_DIVIDER,
-            spaceBefore=8,
-            spaceAfter=6,
+            width="100%", thickness=0.5, color=C_DIVIDER, spaceBefore=8, spaceAfter=6
         )
     )
     story.append(
@@ -709,7 +1181,7 @@ def generate_job_pdf(jd: JobDescription, output_path: str) -> str:
         )
     )
 
-    # ── Build PDF ──
+    # Build PDF
     doc = SimpleDocTemplate(
         output_path,
         pagesize=A4,
@@ -721,17 +1193,13 @@ def generate_job_pdf(jd: JobDescription, output_path: str) -> str:
         author="Si2 Technologies - JD Pipeline",
     )
     doc.build(story)
-    logger_pdf.info("Generated PDF: %s (%d sections)", output_path, len(jd.sections))
+    logger.info("  Generated PDF: %s (%d sections)", output_path, len(jd.sections))
     return output_path
 
 
 def _build_meta_pairs(jd: JobDescription) -> list[tuple[str, str]]:
-    """Build ordered (label, value) pairs for the metadata grid."""
     pairs = []
-    # Combine Job Type and Employment Type into one field
-    combined_job_type = " / ".join(
-        filter(None, [jd.job_type, jd.employment_type])
-    )
+    combined_job_type = " / ".join(filter(None, [jd.job_type, jd.employment_type]))
     for label, val in [
         ("Location", jd.location),
         ("Job Type", combined_job_type),
@@ -749,9 +1217,7 @@ def _safe(text: str) -> str:
     """Escape text for ReportLab Paragraph XML."""
     if not text:
         return ""
-
     clean_text = BeautifulSoup(text, "html.parser").get_text()
-
     clean_text = clean_text.replace("&", "&amp;")
     clean_text = clean_text.replace("<", "&lt;")
     clean_text = clean_text.replace(">", "&gt;")
@@ -759,290 +1225,101 @@ def _safe(text: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  SHAREPOINT UPLOADER  (reused from app.py with JD-specific logic)
+#  JSON → TEXT CONVERSION (from experiment_json_to_text_jd.py)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-logger_sp = logging.getLogger("sharepoint_uploader")
-
-# Maps code-side keys to SharePoint custom column names.
-# These columns must be created in the SharePoint document library first.
-JD_FIELD_MAP = {
-    "JDTitle": "JDTitle",
-    "JDLocation": "JDLocation",
-    "JDJobType": "JDJobType",
-    "JDDepartment": "JDDepartment",
-    "JDExperience": "JDExperience",
-    "JDJobCategory": "JDJobCategory",
-    "JDScrapedDate": "JDScrapedDate",
-    "JDSourceURL": "JDSourceURL",
+# Metadata fields to include in the text rendering
+_TEXT_META_FIELDS = {
+    "title": "Job Title",
+    "location": "Location",
+    "job_type": "Job Type",
+    "department": "Department",
+    "shifts": "Shifts",
+    "experience": "Experience Required",
 }
 
 
-class SharePointUploader:
-    """Uploads files to SharePoint and checks for existing files."""
+def _bullets_to_prose(bullets: list[str]) -> str:
+    """Convert a list of bullet strings into a single prose sentence."""
+    cleaned = [b.strip(" .,") for b in bullets if b.strip()]
+    if not cleaned:
+        return ""
+    if len(cleaned) == 1:
+        return cleaned[0] + "."
+    return ", ".join(cleaned[:-1]) + ", and " + cleaned[-1] + "."
 
-    def __init__(self, auth_headers: dict):
-        self.headers = auth_headers
-        self.base = config.GRAPH_BASE_URL
-        self._site_id: str | None = None
-        self._drive_id: str | None = None
-        self._ensured_folders: set[str] = set()
-        self._existing_files: set[str] | None = None
 
-    # ── Public ────────────────────────────────────────────────────────────────
+def _strip_html(text: str) -> str:
+    return re.sub(r"<[^>]+>", "", text).strip()
 
-    def file_exists_on_sharepoint(self, filename: str) -> bool:
-        """Check if a file already exists in the JobDescriptions folder (cached)."""
-        if self._existing_files is None:
-            self._existing_files = self._list_existing_files()
-        return filename.lower() in self._existing_files
 
-    def upload_jd(
-        self, file_path: str, target_filename: str, metadata: dict | None = None
-    ) -> dict:
-        """
-        Upload a JD PDF to the JobDescriptions/ folder and optionally
-        tag it with metadata columns.
-        """
-        drive_id = self._get_drive_id()
-        folder = config.SHAREPOINT_JD_FOLDER.strip("/")
-        self._ensure_folder(drive_id, folder)
+def _section_to_prose(section: dict) -> str:
+    parts = []
+    heading = section.get("heading", "").strip()
+    paragraphs = [_strip_html(p) for p in section.get("paragraphs", []) if p.strip()]
+    bullets = [_strip_html(b) for b in section.get("bullets", []) if b.strip()]
 
-        file_size = os.path.getsize(file_path)
-        if file_size < 4 * 1024 * 1024:
-            item = self._simple_upload(drive_id, folder, target_filename, file_path)
-        else:
-            item = self._resumable_upload(
-                drive_id, folder, target_filename, file_path, file_size
-            )
+    if paragraphs:
+        parts.append(" ".join(paragraphs))
+    if bullets:
+        parts.append(_bullets_to_prose(bullets))
 
-        logger_sp.info(
-            "Uploaded '%s' -> SharePoint:/%s/%s (id: %s)",
-            target_filename,
-            folder,
-            target_filename,
-            item.get("id"),
-        )
+    if not parts:
+        return ""
 
-        # Tag the uploaded file with metadata
-        if metadata:
-            self._set_metadata(drive_id, item["id"], metadata)
+    body = " ".join(parts)
+    return f"{heading}: {body}" if heading else body
 
-        if self._existing_files is not None:
-            self._existing_files.add(target_filename.lower())
-        return item
 
-    # ── List existing files ───────────────────────────────────────────────────
+def json_to_text(data: dict) -> str:
+    """Convert a structured JD JSON dict into a plain-text summary."""
+    lines = []
 
-    def _list_existing_files(self) -> set[str]:
-        try:
-            drive_id = self._get_drive_id()
-            folder = config.SHAREPOINT_JD_FOLDER.strip("/")
-            encoded = quote(folder)
-            url = (
-                f"{self.base}/drives/{drive_id}/root:/{encoded}:/children"
-                f"?$select=name&$top=1000"
-            )
-            filenames: set[str] = set()
-            while url:
-                resp = requests.get(url, headers=self.headers, timeout=30)
-                if resp.status_code == 404:
-                    return set()
-                resp.raise_for_status()
-                data = resp.json()
-                for item in data.get("value", []):
-                    filenames.add(item["name"].lower())
-                url = data.get("@odata.nextLink")
-            logger_sp.info(
-                "Found %d existing files in SharePoint:/%s/",
-                len(filenames),
-                folder,
-            )
-            return filenames
-        except Exception as e:
-            logger_sp.warning("Could not list existing files: %s", e)
-            return set()
+    # Metadata block
+    meta_parts = []
+    for field_key, label in _TEXT_META_FIELDS.items():
+        value = data.get(field_key, "")
+        if isinstance(value, str):
+            value = value.strip()
+        if value:
+            meta_parts.append(f"{label}: {value}")
+    if meta_parts:
+        lines.append(". ".join(meta_parts) + ".")
 
-    # ── Site / Drive Resolution ───────────────────────────────────────────────
+    required = data.get("required_skills", [])
+    good_to_have = data.get("good_to_have_skills", [])
 
-    def _get_site_id(self) -> str:
-        if self._site_id:
-            return self._site_id
-        domain = config.SHAREPOINT_SITE_DOMAIN
-        path = config.SHAREPOINT_SITE_PATH.strip("/")
-        url = f"{self.base}/sites/{domain}:/{path}"
-        resp = requests.get(url, headers=self.headers, timeout=30)
-        resp.raise_for_status()
-        self._site_id = resp.json()["id"]
-        return self._site_id
+    if required:
+        lines.append("Required Skills: " + _bullets_to_prose(required))
+    if good_to_have:
+        lines.append("Good to Have Skills: " + _bullets_to_prose(good_to_have))
 
-    def _get_drive_id(self) -> str:
-        if self._drive_id:
-            return self._drive_id
-        site_id = self._get_site_id()
-        url = f"{self.base}/sites/{site_id}/drives"
-        resp = requests.get(url, headers=self.headers, timeout=30)
-        resp.raise_for_status()
-        drives = resp.json().get("value", [])
-        target = config.SHAREPOINT_DRIVE_NAME
-        for d in drives:
-            if d["name"].lower() == target.lower():
-                self._drive_id = d["id"]
-                return self._drive_id
-        if drives:
-            self._drive_id = drives[0]["id"]
-            logger_sp.warning(
-                "Drive '%s' not found — using default '%s'.",
-                target,
-                drives[0]["name"],
-            )
-            return self._drive_id
-        raise RuntimeError(f"No drives found on site {site_id}")
+    for section in data.get("sections", []):
+        heading = section.get("heading", "")
+        if heading in ("Must Have Skills", "Good to Have Skills"):
+            continue
+        prose = _section_to_prose(section)
+        if prose:
+            lines.append(prose)
 
-    # ── Folder Management ─────────────────────────────────────────────────────
-
-    def _ensure_folder(self, drive_id: str, folder_path: str) -> None:
-        if folder_path in self._ensured_folders:
-            return
-        parts = folder_path.strip("/").split("/")
-        current = ""
-        for part in parts:
-            current = f"{current}/{part}" if current else part
-            if current in self._ensured_folders:
-                continue
-            encoded = quote(current)
-            check_url = f"{self.base}/drives/{drive_id}/root:/{encoded}"
-            resp = requests.get(check_url, headers=self.headers, timeout=15)
-            if resp.status_code == 404:
-                if "/" in current:
-                    parent_encoded = quote("/".join(current.split("/")[:-1]))
-                    create_url = (
-                        f"{self.base}/drives/{drive_id}/root:/"
-                        f"{parent_encoded}:/children"
-                    )
-                else:
-                    create_url = f"{self.base}/drives/{drive_id}/root/children"
-                body = {
-                    "name": part,
-                    "folder": {},
-                    "@microsoft.graph.conflictBehavior": "fail",
-                }
-                cr = requests.post(
-                    create_url,
-                    headers=self.headers,
-                    json=body,
-                    timeout=15,
-                )
-                if cr.status_code in (201, 409):
-                    logger_sp.info("Created folder: %s", current)
-                else:
-                    logger_sp.error(
-                        "Could not create folder '%s': %s %s",
-                        current,
-                        cr.status_code,
-                        cr.text,
-                    )
-            self._ensured_folders.add(current)
-
-    # ── Upload Methods ────────────────────────────────────────────────────────
-
-    def _simple_upload(
-        self,
-        drive_id: str,
-        folder: str,
-        filename: str,
-        file_path: str,
-    ) -> dict:
-        encoded_path = quote(f"{folder}/{filename}")
-        url = f"{self.base}/drives/{drive_id}/root:/{encoded_path}:/content"
-        with open(file_path, "rb") as f:
-            headers = {**self.headers, "Content-Type": "application/pdf"}
-            resp = requests.put(url, headers=headers, data=f, timeout=120)
-        resp.raise_for_status()
-        return resp.json()
-
-    def _resumable_upload(
-        self,
-        drive_id: str,
-        folder: str,
-        filename: str,
-        file_path: str,
-        file_size: int,
-    ) -> dict:
-        encoded_path = quote(f"{folder}/{filename}")
-        url = f"{self.base}/drives/{drive_id}/root:/{encoded_path}:/createUploadSession"
-        body = {
-            "item": {
-                "@microsoft.graph.conflictBehavior": "rename",
-                "name": filename,
-            }
-        }
-        resp = requests.post(url, headers=self.headers, json=body, timeout=30)
-        resp.raise_for_status()
-        upload_url = resp.json()["uploadUrl"]
-
-        chunk_size = 4 * 1024 * 1024
-        with open(file_path, "rb") as f:
-            offset = 0
-            while offset < file_size:
-                chunk = f.read(chunk_size)
-                end = offset + len(chunk) - 1
-                chunk_headers = {
-                    "Content-Length": str(len(chunk)),
-                    "Content-Range": f"bytes {offset}-{end}/{file_size}",
-                }
-                resp = requests.put(
-                    upload_url,
-                    headers=chunk_headers,
-                    data=chunk,
-                    timeout=120,
-                )
-                resp.raise_for_status()
-                offset += len(chunk)
-        return resp.json()
-
-    # ── Metadata ──────────────────────────────────────────────────────────────
-
-    def _set_metadata(self, drive_id: str, item_id: str, metadata: dict) -> None:
-        """Set custom column values on the uploaded file's SharePoint list item."""
-        url = f"{self.base}/drives/{drive_id}/items/{item_id}/listItem/fields"
-        fields = {
-            JD_FIELD_MAP[k]: v for k, v in metadata.items() if k in JD_FIELD_MAP and v
-        }
-        if not fields:
-            logger_sp.warning("No metadata to set for item %s", item_id)
-            return
-
-        resp = requests.patch(url, headers=self.headers, json=fields, timeout=30)
-        if resp.status_code == 200:
-            logger_sp.info("Metadata set on item %s: %s", item_id, list(fields.keys()))
-        else:
-            logger_sp.warning(
-                "Failed to set metadata on %s (HTTP %s): %s",
-                item_id,
-                resp.status_code,
-                resp.text,
-            )
+    return "\n\n".join(lines)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  NOTIFICATIONS
+#  TEAMS NOTIFICATIONS
 # ═══════════════════════════════════════════════════════════════════════════════
-
-logger_notif = logging.getLogger("notifications")
 
 
 def send_jd_summary(results: dict) -> None:
     """Send a summary of the JD pipeline run to Teams."""
-    if not config.TEAMS_WEBHOOK_URL:
+    if not Config.TEAMS_WEBHOOK_URL:
         return
 
-    if results.get("uploaded", 0) == 0:
-        logger_notif.info("No new JDs uploaded. Skipping Teams notification.")
+    if results.get("uploaded", 0) == 0 and results.get("text_uploaded", 0) == 0:
+        logger.info("No new JDs uploaded. Skipping Teams notification.")
         return
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    total = results["uploaded"] + results["skipped"] + results["failed"]
 
     card = {
         "type": "message",
@@ -1058,21 +1335,31 @@ def send_jd_summary(results: dict) -> None:
                             "type": "TextBlock",
                             "size": "Large",
                             "weight": "Bolder",
-                            "text": f"Job Description Pipeline - {now}",
+                            "text": f"Job Description Pipeline — {now}",
                         },
                         {
                             "type": "FactSet",
                             "facts": [
-                                {"title": "Total Jobs Found", "value": str(total)},
                                 {
-                                    "title": "New PDFs Uploaded",
-                                    "value": str(results["uploaded"]),
+                                    "title": "PDFs Uploaded",
+                                    "value": str(results.get("uploaded", 0)),
                                 },
                                 {
-                                    "title": "Already Existed (Skipped)",
-                                    "value": str(results["skipped"]),
+                                    "title": "PDFs Skipped",
+                                    "value": str(results.get("skipped", 0)),
                                 },
-                                {"title": "Failed", "value": str(results["failed"])},
+                                {
+                                    "title": "PDFs Failed",
+                                    "value": str(results.get("failed", 0)),
+                                },
+                                {
+                                    "title": "Text Files Uploaded",
+                                    "value": str(results.get("text_uploaded", 0)),
+                                },
+                                {
+                                    "title": "Text Files Skipped",
+                                    "value": str(results.get("text_skipped", 0)),
+                                },
                             ],
                         },
                     ],
@@ -1082,264 +1369,110 @@ def send_jd_summary(results: dict) -> None:
     }
 
     try:
-        resp = requests.post(
-            config.TEAMS_WEBHOOK_URL,
+        requests.post(
+            Config.TEAMS_WEBHOOK_URL,
             json=card,
             headers={"Content-Type": "application/json"},
             timeout=15,
         )
-        if resp.status_code in (200, 202):
-            logger_notif.info("Teams JD notification sent.")
-        else:
-            logger_notif.warning(
-                "Teams webhook returned %s: %s",
-                resp.status_code,
-                resp.text,
-            )
-    except Exception as e:
-        logger_notif.error("Failed to send Teams notification: %s", e)
+    except Exception:
+        pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  MAIN PIPELINE
+#  PIPELINE — Scrape → Parse → PDF Upload → Text Upload (per job, single pass)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-logger = logging.getLogger("jd_pipeline")
 
-# ── Section-heading keyword sets for structured extraction ─────────────────
-_SKILL_HEADINGS = {
-    "must have skills", "must-have skills", "required skills",
-    "technical skills", "key skills", "core competencies",
-    "skills required", "skills",
-}
-_TOOL_HEADINGS = {
-    "tools", "technologies", "tech stack", "platforms",
-    "software", "tools and technologies",
-}
-_EDUCATION_HEADINGS = {
-    "qualifications", "education", "academic qualifications",
-    "candidate requirements", "required qualifications",
-    "eligibility",
-}
-_RESPONSIBILITY_HEADINGS = {
-    "responsibilities", "key responsibilities", "job description",
-    "job summary", "role overview", "position summary",
-    "duties", "what you will do",
-}
-_GOOD_TO_HAVE_HEADINGS = {
-    "good to have", "good to have skills", "nice to have",
-    "preferred qualifications", "preferred skills",
-    "preferred certification", "certifications", "certification",
-}
-
-
-def extract_structured_jd_fields(jd_dict: dict) -> dict:
+def run_pipeline(sp: SharePointManager) -> dict:
     """
-    Extract scorer-compatible structured fields from the raw JD dict.
+    Single-pass pipeline. For each job discovered on the website:
+      1. Parse the job detail page into a structured JobDescription.
+      2. Extract structured fields (skills, tools, education, etc.).
+      3. Generate a branded PDF and upload to SharePoint.
+      4. Convert structured data → plain text in memory → upload to SharePoint.
 
-    Reads sections (heading + bullets + paragraphs) and populates:
-      - required_skills   : list[str]
-      - good_to_have_skills : list[str]
-      - required_tools    : list[str]
-      - min_education     : str
-      - required_experience_years : int | float
-      - responsibilities_text : str
-      - location          : str  (already present, just copied)
-
-    Returns the original dict with these keys added/merged.
+    No intermediate files are saved except temporary PDFs during generation.
+    Returns a results dict with counts.
     """
-    sections = jd_dict.get("sections", [])
-
-    required_skills: list[str] = []
-    good_to_have_skills: list[str] = []
-    required_tools: list[str] = []
-    education_bullets: list[str] = []
-    responsibilities_parts: list[str] = []
-
-    for sec in sections:
-        heading = sec.get("heading", "").strip()
-        heading_lower = heading.lower().rstrip(":")
-        bullets = sec.get("bullets", [])
-        paragraphs = sec.get("paragraphs", [])
-        all_items = bullets + paragraphs
-
-        # ── Skills ──
-        if heading_lower in _SKILL_HEADINGS or any(kw in heading_lower for kw in ("must have", "required skill", "technical skill", "key skill")):
-            required_skills.extend(
-                _clean_html(b) for b in bullets if b.strip()
-            )
-            for p in paragraphs:
-                cleaned = _clean_html(p)
-                # Skip sub-headings like "Scripting Languages:"
-                if cleaned and not cleaned.endswith(":"):
-                    required_skills.append(cleaned)
-            continue
-
-        # ── Tools (explicit tools section) ──
-        if heading_lower in _TOOL_HEADINGS or any(kw in heading_lower for kw in ("tools", "technologies", "tech stack")):
-            required_tools.extend(
-                _clean_html(b) for b in bullets if b.strip()
-            )
-            continue
-
-        # ── Good to have ──
-        if heading_lower in _GOOD_TO_HAVE_HEADINGS or any(kw in heading_lower for kw in ("good to have", "nice to have", "preferred")):
-            good_to_have_skills.extend(
-                _clean_html(b) for b in bullets if b.strip()
-            )
-            continue
-
-        # ── Education / Qualifications ──
-        if heading_lower in _EDUCATION_HEADINGS or any(kw in heading_lower for kw in ("qualif", "education", "eligib")):
-            education_bullets.extend(
-                _clean_html(b) for b in bullets if b.strip()
-            )
-            for p in paragraphs:
-                cleaned = _clean_html(p)
-                if cleaned:
-                    education_bullets.append(cleaned)
-            continue
-
-        # ── Responsibilities / Job Description ──
-        if heading_lower in _RESPONSIBILITY_HEADINGS or any(kw in heading_lower for kw in ("responsibilit", "job description", "job summary", "dut")):
-            for p in paragraphs:
-                cleaned = _clean_html(p)
-                if cleaned:
-                    responsibilities_parts.append(cleaned)
-            for b in bullets:
-                cleaned = _clean_html(b)
-                if cleaned:
-                    responsibilities_parts.append(cleaned)
-            continue
-
-        # ── Any other section → add bullets to responsibilities ──
-        for b in bullets:
-            cleaned = _clean_html(b)
-            if cleaned:
-                responsibilities_parts.append(cleaned)
-        for p in paragraphs:
-            cleaned = _clean_html(p)
-            if cleaned and not cleaned.endswith(":"):
-                responsibilities_parts.append(cleaned)
-
-    # ── Parse experience years from the "experience" text field ──
-    exp_text = jd_dict.get("experience", "") or ""
-    required_yoe = _parse_experience_years(exp_text)
-
-    # ── Build min_education string ──
-    min_education = "; ".join(education_bullets) if education_bullets else ""
-
-    # ── Merge into the dict ──
-    jd_dict["required_skills"] = required_skills
-    jd_dict["good_to_have_skills"] = good_to_have_skills
-    jd_dict["required_tools"] = required_tools
-    jd_dict["min_education"] = min_education
-    jd_dict["required_experience_years"] = required_yoe
-    jd_dict["responsibilities_text"] = " ".join(responsibilities_parts)
-
-    return jd_dict
-
-
-def _clean_html(text: str) -> str:
-    """Strip HTML tags from a string."""
-    if not text:
-        return ""
-    return BeautifulSoup(text, "html.parser").get_text(strip=True)
-
-
-def _parse_experience_years(text: str) -> int:
-    """
-    Extract numeric years from an experience string.
-    Examples: '6+ years' → 6, '0 – 2 Years' → 0, '3-5 years' → 3
-    """
-    if not text:
-        return 0
-    # Look for patterns like '6+', '3-5', '0 – 2'
-    m = re.search(r"(\d+)\s*[+\-–—]?", text)
-    if m:
-        return int(m.group(1))
-    return 0
-
-
-def setup_logging():
-    os.makedirs(os.path.dirname(config.LOG_FILE) or ".", exist_ok=True)
-    handlers = [
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(config.LOG_FILE, encoding="utf-8"),
-    ]
-    logging.basicConfig(
-        level=getattr(logging, config.LOG_LEVEL.upper(), logging.INFO),
-        format="%(asctime)s | %(levelname)-7s | %(name)-22s | %(message)s",
-        handlers=handlers,
-    )
-    logging.getLogger("urllib3").setLevel(logging.WARNING)
-
-
-def run_pipeline():
-    setup_logging()
     logger.info("=" * 70)
-    logger.info(
-        "JOB DESCRIPTION PIPELINE — RUN STARTED at %s",
-        datetime.now().isoformat(),
-    )
+    logger.info("JD PIPELINE — SCRAPE → PDF → TEXT (single pass)")
     logger.info("=" * 70)
 
-    # ── Step 1: Validate config ──
-    missing = []
-    for var in ("TENANT_ID", "CLIENT_ID", "CLIENT_SECRET"):
-        if not getattr(config, var):
-            missing.append(var)
-    if missing:
-        logger.critical(
-            "Missing required config: %s. Set them in .env or environment.",
-            missing,
-        )
-        sys.exit(1)
-
-    # ── Step 2: Authenticate ──
-    auth = GraphAuthProvider()
-    headers = auth.get_headers()
-    logger.info("Authentication successful.")
-
-    # ── Step 3: Discover all job listing URLs ──
-    logger.info("Discovering jobs from %s ...", config.JOBS_ARCHIVE_URL)
+    # Discover all job listing URLs
+    logger.info("Discovering jobs from %s …", Config.JOBS_ARCHIVE_URL)
     job_urls = discover_job_urls()
     logger.info("Found %d job listings total.", len(job_urls))
 
     if not job_urls:
-        logger.info("No job listings found. Exiting.")
-        return
+        logger.info("No job listings found.")
+        return {
+            "uploaded": 0,
+            "skipped": 0,
+            "failed": 0,
+            "text_uploaded": 0,
+            "text_skipped": 0,
+            "text_failed": 0,
+        }
 
-    # ── Step 4: Set up SharePoint uploader ──
-    uploader = SharePointUploader(auth_headers=headers)
-    os.makedirs(config.TEMP_DIR, exist_ok=True)
+    os.makedirs(Config.TEMP_DIR, exist_ok=True)
 
-    results = {"uploaded": 0, "skipped": 0, "failed": 0}
+    results = {
+        "uploaded": 0,
+        "skipped": 0,
+        "failed": 0,
+        "text_uploaded": 0,
+        "text_skipped": 0,
+        "text_failed": 0,
+    }
 
-    # ── Step 5: Process each job ──
     for idx, job_info in enumerate(job_urls, 1):
         url = job_info["url"]
         title = job_info.get("title", "")
         slug = url.rstrip("/").split("/")[-1]
         safe_slug = re.sub(r"[^\w\-]", "", slug)
         pdf_filename = f"JD_{safe_slug}.pdf"
+        txt_filename = f"JD_{safe_slug}.txt"
 
-        logger.info("-" * 60)
-        logger.info(
-            "[%d/%d] %s (%s)",
-            idx,
-            len(job_urls),
-            title or slug,
-            pdf_filename,
-        )
+        logger.info("─" * 60)
+        logger.info("[%d/%d] %s (%s)", idx, len(job_urls), title or slug, pdf_filename)
 
-        # ── Check if already on SharePoint ──
-        if uploader.file_exists_on_sharepoint(pdf_filename):
-            logger.info("  SKIP — already exists on SharePoint.")
+        # Check if PDF already exists on SharePoint
+        if sp.jd_pdf_exists(pdf_filename):
+            logger.info("  SKIP — PDF already exists on SharePoint.")
             results["skipped"] += 1
+            # Still check if text file needs uploading for this job
+            # (handles case where PDF was uploaded in a prior run but text wasn't)
+            txt_remote = f"{Config.TEXT_JD_FOLDER.strip('/')}/{txt_filename}"
+            if sp.file_exists(txt_remote):
+                results["text_skipped"] += 1
+            else:
+                logger.info(
+                    "  PDF exists but text file missing — scraping for text only."
+                )
+                # Fall through to parse + text upload (skip PDF upload below)
+                try:
+                    jd = parse_job_detail(url, fallback_title=title)
+                    jd_dict = asdict(jd)
+                    jd_dict = extract_structured_jd_fields(jd_dict)
+                    text_content = json_to_text(jd_dict)
+                    if text_content.strip():
+                        resp = sp.upload_jd_text(
+                            text_content=text_content,
+                            filename=txt_filename,
+                            metadata={"Title": jd.title, "JDTitle": jd.title},
+                            skip_existing=False,
+                        )
+                        if resp:
+                            results["text_uploaded"] += 1
+                    else:
+                        results["text_failed"] += 1
+                except Exception as e:
+                    logger.error("  FAIL — text-only upload: %s", e)
+                    results["text_failed"] += 1
             continue
 
-        # ── Parse job detail page ──
+        # ── Step 1: Parse job detail page ──
         try:
             jd = parse_job_detail(url, fallback_title=title)
             logger.info(
@@ -1354,102 +1487,158 @@ def run_pipeline():
         except Exception as e:
             logger.error("  FAIL — parse error for %s: %s", url, e, exc_info=True)
             results["failed"] += 1
+            results["text_failed"] += 1
             continue
 
-        # ── Save JD as JSON locally ──
-        json_dir = config.JD_JSON_DIR
-        os.makedirs(json_dir, exist_ok=True)
-        json_filename = f"JD_{safe_slug}.json"
-        json_path = os.path.join(json_dir, json_filename)
-        try:
-            jd_dict = asdict(jd)
-            # Extract structured fields for scorer compatibility
-            jd_dict = extract_structured_jd_fields(jd_dict)
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(jd_dict, f, indent=2, ensure_ascii=False)
-            logger.info(
-                "  Saved JD JSON: %s (skills=%d, tools=%d, edu='%s', yoe=%s)",
-                json_path,
-                len(jd_dict.get("required_skills", [])),
-                len(jd_dict.get("required_tools", [])),
-                jd_dict.get("min_education", "")[:50],
-                jd_dict.get("required_experience_years", 0),
-            )
-        except Exception as e:
-            logger.warning("  Could not save JD JSON: %s", e)
+        # ── Step 2: Extract structured fields (in memory) ──
+        jd_dict = asdict(jd)
+        jd_dict = extract_structured_jd_fields(jd_dict)
 
-        # ── Generate PDF ──
-        local_path = os.path.join(config.TEMP_DIR, pdf_filename)
+        logger.info(
+            "  Structured: skills=%d, tools=%d, yoe=%s",
+            len(jd_dict.get("required_skills", [])),
+            len(jd_dict.get("required_tools", [])),
+            jd_dict.get("required_experience_years", 0),
+        )
+
+        # ── Step 3: Generate PDF & upload ──
+        local_pdf_path = os.path.join(Config.TEMP_DIR, pdf_filename)
         try:
-            generate_job_pdf(jd, local_path)
+            generate_job_pdf(jd, local_pdf_path)
         except Exception as e:
             logger.error("  FAIL — PDF generation: %s", e, exc_info=True)
             results["failed"] += 1
-            continue
+            # Still attempt text upload even if PDF fails
+            local_pdf_path = None
 
-        # ── Upload to SharePoint ──
+        if local_pdf_path and os.path.exists(local_pdf_path):
+            try:
+                combined_job_type = " / ".join(
+                    filter(None, [jd.job_type, jd.employment_type])
+                )
+                jd_metadata = {
+                    "JDTitle": jd.title,
+                    "JDLocation": jd.location,
+                    "JDJobType": combined_job_type,
+                    "JDDepartment": jd.department,
+                    "JDExperience": jd.experience,
+                    "JDJobCategory": jd.job_category,
+                    "JDScrapedDate": jd.scraped_date,
+                    "JDSourceURL": jd.url,
+                }
+                sp.upload_jd_pdf(
+                    file_path=local_pdf_path,
+                    target_filename=pdf_filename,
+                    metadata=jd_metadata,
+                )
+                results["uploaded"] += 1
+            except Exception as e:
+                results["failed"] += 1
+                logger.error("  FAIL — PDF upload: %s", e, exc_info=True)
+
+            # Clean up temp PDF
+            try:
+                os.remove(local_pdf_path)
+            except OSError:
+                pass
+
+        # ── Step 4: Convert to text (in memory) & upload ──
         try:
-            # Build metadata dict from parsed JD
-            # Combine Job Type + Employment Type into one field
-            combined_job_type = " / ".join(
-                filter(None, [jd.job_type, jd.employment_type])
-            )
-            jd_metadata = {
-                "JDTitle": jd.title,
-                "JDLocation": jd.location,
-                "JDJobType": combined_job_type,
-                "JDDepartment": jd.department,
-                "JDExperience": jd.experience,
-                "JDJobCategory": jd.job_category,
-                "JDScrapedDate": jd.scraped_date,
-                "JDSourceURL": jd.url,
-            }
-            uploader.upload_jd(
-                file_path=local_path,
-                target_filename=pdf_filename,
-                metadata=jd_metadata,
-            )
-            results["uploaded"] += 1
-            logger.info(
-                "  OK — uploaded to SharePoint:/%s/%s",
-                config.SHAREPOINT_JD_FOLDER,
-                pdf_filename,
-            )
+            text_content = json_to_text(jd_dict)
+            if not text_content.strip():
+                logger.warning(
+                    "  ⚠️ Text conversion produced empty result. Skipping text upload."
+                )
+                results["text_failed"] += 1
+            else:
+                resp = sp.upload_jd_text(
+                    text_content=text_content,
+                    filename=txt_filename,
+                    metadata={"Title": jd.title, "JDTitle": jd.title},
+                    skip_existing=True,
+                )
+                if resp is None:
+                    results["text_skipped"] += 1
+                else:
+                    results["text_uploaded"] += 1
         except Exception as e:
-            results["failed"] += 1
-            logger.error("  FAIL — upload: %s", e, exc_info=True)
-
-        # ── Clean up ──
-        try:
-            os.remove(local_path)
-        except OSError:
-            pass
-
-    # ── Step 6: Send Teams notification ──
-    send_jd_summary(results)
+            logger.error("  FAIL — text upload: %s", e)
+            results["text_failed"] += 1
 
     # ── Summary ──
     logger.info("=" * 70)
     logger.info(
-        "PIPELINE COMPLETE — Uploaded: %d | Skipped: %d | Failed: %d",
+        "PIPELINE COMPLETE — PDFs: %d uploaded, %d skipped, %d failed | "
+        "Text: %d uploaded, %d skipped, %d failed",
         results["uploaded"],
         results["skipped"],
         results["failed"],
+        results["text_uploaded"],
+        results["text_skipped"],
+        results["text_failed"],
     )
     logger.info("=" * 70)
 
-    # ── Clean up temp directory ──
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MAIN ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def main():
+    setup_logging()
+
+    logger.info("╔══════════════════════════════════════════════════════════════╗")
+    logger.info("║          JD PIPELINE — RUN STARTED                          ║")
+    logger.info("╚══════════════════════════════════════════════════════════════╝")
+
+    # Validate config
+    missing = []
+    for var in ("TENANT_ID", "CLIENT_ID", "CLIENT_SECRET"):
+        if not getattr(Config, var):
+            missing.append(var)
+    if missing:
+        logger.critical(
+            "Missing required config: %s. Set them in .env or environment.", missing
+        )
+        sys.exit(1)
+
+    # Authenticate
     try:
-        if os.path.isdir(config.TEMP_DIR):
-            shutil.rmtree(config.TEMP_DIR)
-            logger.info("Cleaned up temp directory: %s", config.TEMP_DIR)
+        auth = GraphAuthProvider()
+        _ = auth.get_access_token()
+        logger.info("✅ Microsoft Graph authentication successful.")
+    except Exception as e:
+        logger.critical("❌ Authentication failed: %s", e)
+        sys.exit(1)
+
+    headers = auth.get_headers()
+    sp = SharePointManager(auth_headers=headers)
+
+    # Run pipeline
+    results = {}
+    try:
+        results = run_pipeline(sp)
+    except Exception as e:
+        logger.error("Pipeline failed with error: %s", e, exc_info=True)
+
+    # Send Teams notification
+    send_jd_summary(results)
+
+    # Cleanup
+    try:
+        if os.path.isdir(Config.TEMP_DIR):
+            shutil.rmtree(Config.TEMP_DIR)
+            logger.info("Cleaned up temp directory: %s", Config.TEMP_DIR)
     except OSError as e:
-        logger.warning("Could not remove temp directory %s: %s", config.TEMP_DIR, e)
+        logger.warning("Could not remove temp directory: %s", e)
 
+    logger.info("╔══════════════════════════════════════════════════════════════╗")
+    logger.info("║          JD PIPELINE — ALL DONE                             ║")
+    logger.info("╚══════════════════════════════════════════════════════════════╝")
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  ENTRY POINT
-# ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    run_pipeline()
+    main()

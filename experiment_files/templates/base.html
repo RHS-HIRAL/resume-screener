@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -8,6 +9,7 @@
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 </head>
+
 <body>
     <div class="app-container">
         <!-- Sidebar -->
@@ -16,24 +18,34 @@
                 <i class="fa-solid fa-magnifying-glass-chart"></i>
                 <span>Screener AI</span>
             </div>
-            
+
             <nav class="nav-links">
                 <li class="nav-item">
-                    <a href="{{ url_for('dashboard') }}" class="nav-link {% if request.endpoint == 'dashboard' %}active{% endif %}">
+                    <a href="{{ url_for('dashboard') }}"
+                        class="nav-link {% if request.endpoint == 'dashboard' %}active{% endif %}">
                         <i class="fa-solid fa-house"></i>
                         <span>Dashboard</span>
                     </a>
                 </li>
                 <li class="nav-item">
-                    <a href="{{ url_for('screener') }}" class="nav-link {% if request.endpoint == 'screener' %}active{% endif %}">
+                    <a href="{{ url_for('screener') }}"
+                        class="nav-link {% if request.endpoint == 'screener' %}active{% endif %}">
                         <i class="fa-solid fa-file-invoice"></i>
                         <span>Screen Resume</span>
                     </a>
                 </li>
                 <li class="nav-item">
-                    <a href="{{ url_for('outreach') }}" class="nav-link {% if request.endpoint == 'outreach' %}active{% endif %}">
+                    <a href="{{ url_for('outreach') }}"
+                        class="nav-link {% if request.endpoint == 'outreach' %}active{% endif %}">
                         <i class="fa-solid fa-paper-plane"></i>
                         <span>Outreach</span>
+                    </a>
+                </li>
+                <li class="nav-item">
+                    <a href="{{ url_for('responses') }}"
+                        class="nav-link {% if request.endpoint == 'responses' %}active{% endif %}">
+                        <i class="fa-solid fa-clipboard-check"></i>
+                        <span>Review Responses</span>
                     </a>
                 </li>
             </nav>
@@ -43,7 +55,8 @@
                 <div class="avatar">{{ current_user.username[0].upper() }}</div>
                 <div class="user-info">
                     <div style="font-size: 0.9rem; font-weight: 600;">{{ current_user.username }}</div>
-                    <a href="{{ url_for('logout') }}" style="font-size: 0.75rem; color: var(--accent-rose); text-decoration: none;">Log Out</a>
+                    <a href="{{ url_for('logout') }}"
+                        style="font-size: 0.75rem; color: var(--accent-rose); text-decoration: none;">Log Out</a>
                 </div>
             </div>
             {% endif %}
@@ -52,13 +65,14 @@
         <!-- Main Content -->
         <main class="main-content">
             {% with messages = get_flashed_messages(with_categories=true) %}
-                {% if messages %}
-                    {% for category, message in messages %}
-                        <div class="alert alert-{{ category }}" style="padding: 1rem; border-radius: 10px; margin-bottom: 2rem; background: rgba(99, 102, 241, 0.1); border-left: 4px solid var(--accent-indigo);">
-                            {{ message }}
-                        </div>
-                    {% endfor %}
-                {% endif %}
+            {% if messages %}
+            {% for category, message in messages %}
+            <div class="alert alert-{{ category }}"
+                style="padding: 1rem; border-radius: 10px; margin-bottom: 2rem; background: rgba(99, 102, 241, 0.1); border-left: 4px solid var(--accent-indigo);">
+                {{ message }}
+            </div>
+            {% endfor %}
+            {% endif %}
             {% endwith %}
 
             {% block content %}{% endblock %}
@@ -67,4 +81,5 @@
 
     {% block scripts %}{% endblock %}
 </body>
+
 </html>
