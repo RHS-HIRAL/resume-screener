@@ -1,0 +1,10 @@
+Question 1: What is the practical difference between Precision and Recall in a classification model?
+Expected Answer: Precision focuses on quality (minimizing false positives—if the model predicts true, is it actually true?). Recall focuses on quantity (minimizing false negatives—did the model find all the actual true cases?).
+Question 2: When would you choose to use Retrieval-Augmented Generation (RAG) instead of fine-tuning an LLM?
+Expected Answer: Use RAG when the model needs access to dynamic, real-time, or proprietary facts without retraining. Use fine-tuning when you need to change the model's actual behavior, writing style, or output format.
+Question 3: If you need to process a 50GB CSV file in Python but only have 16GB of RAM, how do you handle it?
+Expected Answer: Read and process the data in smaller chunks (e.g., using the chunksize parameter in pandas), use Python generators to process it line-by-line, or use out-of-core libraries like Dask.
+Question 4: Why are vector embeddings preferred over one-hot encoding for text data?
+Expected Answer: Vector embeddings capture the semantic meaning and contextual relationships between words in a dense array. One-hot encoding is sparse, takes up massive memory, and treats every word as completely unrelated to every other word.
+Question 5: What is the biggest trade-off between hosting an open-weight 7B model locally versus using a proprietary API?
+Expected Answer: Local hosting guarantees data privacy and eliminates per-token API costs, but requires managing your own expensive GPU infrastructure. Proprietary APIs offer instant scaling and state-of-the-art performance, but incur ongoing costs and pose data privacy risks.

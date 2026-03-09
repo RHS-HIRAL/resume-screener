@@ -1,0 +1,33 @@
+speaker_1: Hi, is this Alex?
+speaker_2: Yes, speaking. Hi!
+speaker_1: Hi Alex, thanks for taking the time to speak with me today. As we discussed over email, this is a brief technical screening call for the Artificial Intelligence Intern position. It should take about ten minutes. I just have five quick concept questions to gauge your familiarity with some of the concepts we work with. How does that sound?
+speaker_2: That sounds great. I'm ready.
+speaker_1: Perfect. Let's dive right in. For our first question, we do a lot of classification tasks here. In your own words, what is the practical difference between Precision and Recall in a classification model?
+speaker_2: Right, okay. So, they are both metrics to evaluate a model instead of just using accuracy. Precision is basically about how accurate your positive predictions are. Like, out of all the ones the model said were true, how many were actually true? And Recall is more about the total amount. It’s like, out of all the true ones in the dataset, how many did the model manage to find?
+speaker_1: That’s a good summary. Can you relate that to false positives and false negatives for me?
+speaker_2: Sure. Precision is about minimizing... wait, false positives? Because if you predict true but it's false, your precision goes down. And Recall is about minimizing false negatives, I think. Because you don't want to miss the actual true ones.
+speaker_1: Spot on. Let's move to the second question. In modern LLM applications, we often have to choose how to give a model specialized knowledge. When would you choose to use Retrieval-Augmented Generation, or RAG, instead of fine-tuning an LLM?
+speaker_2: Oh, I've read a bit about this. You use RAG when you have a lot of documents, like PDFs, and you want the model to answer questions based on them. It searches the documents and puts the text into the prompt. Fine-tuning is when you actually train the model on the documents so it learns them by heart. So I'd use RAG for documents and fine-tuning if I want it to learn facts permanently.
+speaker_1: You're definitely on the right track with RAG pulling in dynamic facts. But does fine-tuning reliably teach a model new facts?
+speaker_2: Well, it updates the weights, so it should know the information better than before. But I guess it could still hallucinate. Actually, maybe fine-tuning is better for changing how the model talks, like its tone or format, rather than just feeding it facts. RAG is definitely better for facts because it actually looks them up in real-time.
+speaker_1: Exactly, RAG is much better for factual recall without retraining. Good correction. Question three is more of a data engineering problem. If you need to process a 50GB CSV file in Python, but your laptop only has 16GB of RAM, how do you handle it?
+speaker_2: Oh, that happens a lot. I'd probably just spin up a cloud instance with more RAM, like an AWS EC2 instance, to process it. Or use Google Colab Pro.
+speaker_1: Let's assume you can't use cloud resources and you have to run it locally on that 16GB machine. How would you change your Python code to handle it?
+speaker_2: Oh, I see. In that case, I wouldn't use standard Pandas read_csv because it loads the whole thing into memory and it would crash. I think you can read the file line-by-line using a standard open() loop.
+speaker_1: You can. Is there a way to still use Pandas to make it a bit easier than reading line-by-line?
+speaker_2: I think there's a parameter in Pandas... is it chunksize? You can load the data in batches of a few thousand rows, process that chunk, save the result, and then move to the next chunk. That way you never exceed the 16GB.
+speaker_1: Yes, chunksize in Pandas, or using a library like Dask, would be the way to go. Great. Question four: When converting text into a format an AI model can understand, why are vector embeddings preferred over one-hot encoding?
+speaker_2: One-hot encoding is really basic. If you have a vocabulary of 10,000 words, every word is an array of 10,000 numbers with just a single '1' and the rest '0's. It takes up a massive amount of space. Vector embeddings are better because they are smaller arrays.
+speaker_1: They are more compact, yes. That's the difference between sparse and dense representations. But what about the meaning of the words?
+speaker_2: Right! One-hot encoding treats every word as completely different. So 'car' and 'automobile' have no connection. But vector embeddings are trained so that words with similar meanings are close together in the vector space. So the model actually understands that 'car' and 'automobile' are related.
+speaker_1: Perfect. That semantic relationship is key. Okay, final question. What would you say is the biggest trade-off between hosting an open-weight 7B parameter model locally on our own servers versus just using a proprietary API like OpenAI or Anthropic?
+speaker_2: Cost is a big one. If you use an API, you have to pay for every token you send and receive, which can get really expensive if you have a lot of users. If you host a 7B model locally, it's free to use. Plus, with a local model, your data stays totally private. You aren't sending company secrets over the internet.
+speaker_1: Data privacy and avoiding per-token costs are excellent points for local hosting. Is there any downside to the local hosting approach?
+speaker_2: The open-weight models might not be quite as smart as the massive proprietary ones.
+speaker_1: True. What about the hardware?
+speaker_2: Oh, right. You'd need to buy servers with good GPUs to run it fast enough, which is a huge upfront cost. And you have to maintain the servers yourself. So you save on API tokens but spend on hardware and DevOps.
+speaker_1: Exactly. It's a balance of infrastructure costs versus API costs. Well, Alex, that covers all my questions. You did a great job thinking through those concepts. Do you have any quick questions for me about the role?
+speaker_2: Not right now, this was really clear. When can I expect to hear back regarding the next steps?
+speaker_1: We are finishing up our screening calls tomorrow, so you should hear from our recruiting team by early next week. Thanks again for your time today, Alex. Have a great afternoon.
+speaker_2: Thank you, you too. Bye!
+speaker_1: Bye.

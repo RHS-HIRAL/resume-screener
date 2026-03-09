@@ -1,16 +1,16 @@
 :root {
-    --bg-dark: #0d0f14;
-    --sidebar-bg: #13151c;
-    --card-bg: #161a24;
-    --glass-bg: rgba(26, 31, 46, 0.7);
-    --border-color: rgba(255, 255, 255, 0.08);
-    --text-primary: #f0f2fa;
-    --text-secondary: #8b90a0;
-    --accent-indigo: #6366f1;
+    --bg-dark: #f8f9fc;
+    --sidebar-bg: #ffffff;
+    --card-bg: #ffffff;
+    --glass-bg: rgba(255, 255, 255, 0.85);
+    --border-color: rgba(0, 0, 0, 0.08);
+    --text-primary: #1a1d2e;
+    --text-secondary: #64748b;
+    --accent-indigo: #06b6d4;
     --accent-emerald: #10b981;
     --accent-amber: #fbbf24;
     --accent-rose: #f87171;
-    --glass-grad: linear-gradient(135deg, rgba(99, 102, 241, 0.12) 0%, transparent 60%);
+    --glass-grad: linear-gradient(135deg, rgba(6, 182, 212, 0.12) 0%, transparent 60%);
 }
 
 * {
@@ -81,14 +81,14 @@ body {
 }
 
 .nav-link:hover {
-    background: rgba(99, 102, 241, 0.1);
+    background: rgba(6, 182, 212, 0.1);
     color: var(--text-primary);
 }
 
 .nav-link.active {
     background: var(--accent-indigo);
     color: white;
-    box-shadow: 0 4px 15px rgba(99, 102, 241, 0.3);
+    box-shadow: 0 4px 15px rgba(6, 182, 212, 0.3);
 }
 
 .user-profile {
@@ -150,7 +150,7 @@ body {
 }
 
 .card:hover {
-    border-color: rgba(99, 102, 241, 0.3);
+    border-color: rgba(6, 182, 212, 0.3);
 }
 
 .stat-card {
@@ -185,7 +185,7 @@ body {
 
 .form-control {
     width: 100%;
-    background: #1a1f2e;
+    background: #f1f5f9;
     border: 1px solid var(--border-color);
     border-radius: 8px;
     padding: 0.8rem 1rem;
@@ -215,14 +215,14 @@ body {
 }
 
 .btn-primary {
-    background: linear-gradient(135deg, #6366f1, #4f46e5);
+    background: linear-gradient(135deg, #06b6d4, #22d3ee);
     color: white;
-    box-shadow: 0 4px 15px rgba(99, 102, 241, 0.25);
+    box-shadow: 0 4px 15px rgba(6, 182, 212, 0.25);
 }
 
 .btn-primary:hover {
     transform: translateY(-2px);
-    box-shadow: 0 6px 20px rgba(99, 102, 241, 0.4);
+    box-shadow: 0 6px 20px rgba(6, 182, 212, 0.4);
 }
 
 /* ── Score Ring ── */
@@ -233,7 +233,7 @@ body {
 .score-number {
     font-size: 4rem;
     font-weight: 800;
-    background: linear-gradient(135deg, #818cf8, #34d399);
+    background: linear-gradient(135deg, #22d3ee, #34d399);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
     line-height: 1;

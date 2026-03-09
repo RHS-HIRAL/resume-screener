@@ -20,3 +20,5 @@ call_transcribe/results
 .env.local
 deprecated_code
 call_transcribe/audio_files
+call_transcribe/backend/outputs
+call_transcribe/backend/structured_output
